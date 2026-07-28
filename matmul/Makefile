@@ -3,7 +3,7 @@ ARCH      := sm_90
 NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda -Xcompiler -fopenmp
 LDLIBS    := -lcublas -lgomp
 
-SRCS := v0_wmma_naive.cu v1_smem_regblock.cu v2_cublas.cu
+SRCS := v0_wmma_naive.cu v1_smem.cu v2_cublas.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
