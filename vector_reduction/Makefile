@@ -1,15 +1,15 @@
 NVCC      := nvcc
 ARCH      := sm_90
-NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda -Xcompiler -fopenmp
-LDLIBS    := -lcublas -lgomp
+NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo
 
-SRCS := v0_wmma_naive.cu v1_smem_regblock.cu v2_cublas.cu
+SRCS := v0_interleaved_divergent.cu v1_contiguous.cu v2_two_per_thread.cu \
+        v3_warp_unroll.cu v4_warp_shuffle.cu v5_grid_stride.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
 
 %: %.cu
-	$(NVCC) $(NVCCFLAGS) $< -o $@ $(LDLIBS)
+	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 run: all
 	@for b in $(BINS); do ./$$b; done

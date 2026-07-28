@@ -112,6 +112,14 @@ int main() {
         h_input[i] = (float)rand() / RAND_MAX * 20.0f - 10.0f;  // [-10, 10)
     }
 
+    const int block_size = 256;
+    const int grid_size = CEIL(N, block_size);
+    printf("softmax  (N = %d, block = %d, grid = %d)\n", N, block_size, grid_size);
+
+    // ---- 1. 先算 CPU 参考 ----
+    cpu_softmax(h_input, h_ref, N);
+
+    // ---- 2. 再跑 GPU，单轮 ----
     float *d_input, *d_output, *d_sum, *d_max;
     CUDA_CHECK(cudaMalloc(&d_input, bytes));
     CUDA_CHECK(cudaMalloc(&d_output, bytes));
@@ -119,69 +127,38 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_max, sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_input, h_input, bytes, cudaMemcpyHostToDevice));
 
-    // max_val 初值必须是 -FLT_MAX，sum 初值 0
-    float init_max = -FLT_MAX, init_sum = 0.0f;
+    // max_val 初值必须是 -FLT_MAX，sum 初值 0：两者都是 atomic 累加出来的
+    const float init_max = -FLT_MAX, init_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_sum, &init_sum, sizeof(float), cudaMemcpyHostToDevice));
 
-    const int block_size = 256;
-    const int grid_size = CEIL(N, block_size);
-
-    // max/sum 是 atomic 累加出来的，每轮都必须重置，否则结果会被上一轮污染
-    auto reset_and_run = [&]() {
-        CUDA_CHECK(cudaMemcpy(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_sum, &init_sum, sizeof(float), cudaMemcpyHostToDevice));
-        max_kernel<<<grid_size, block_size>>>(d_input, d_max, N);
-        sum_kernel<<<grid_size, block_size>>>(d_input, d_sum, d_max, N);
-        softmax_kernel<<<grid_size, block_size>>>(d_input, d_output, d_sum, d_max, N);
-    };
-
-    reset_and_run();  // warmup：避开首次 launch 的 context/module 加载开销
+    max_kernel<<<grid_size, block_size>>>(d_input, d_max, N);
+    sum_kernel<<<grid_size, block_size>>>(d_input, d_sum, d_max, N);
+    softmax_kernel<<<grid_size, block_size>>>(d_input, d_output, d_sum, d_max, N);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
-
-    const int iters = 20;
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
-    for (int i = 0; i < iters; ++i) reset_and_run();
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaGetLastError());
-
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    ms /= iters;
     CUDA_CHECK(cudaMemcpy(h_output, d_output, bytes, cudaMemcpyDeviceToHost));
 
-    cpu_softmax(h_input, h_ref, N);
-
-    // 精度验证：softmax 输出量级约 1/N，用相对误差判断
+    // ---- 3. 精度验证：softmax 输出量级约 1/N，用相对误差判断 ----
     double max_rel_err = 0.0;
     int bad_idx = -1;
     double gpu_sum = 0.0;
     for (int i = 0; i < N; ++i) {
         gpu_sum += h_output[i];
-        double denom = fabs(h_ref[i]) > 1e-30 ? fabs(h_ref[i]) : 1e-30;
-        double rel = fabs(h_output[i] - h_ref[i]) / denom;
+        const double denom = fabs(h_ref[i]) > 1e-30 ? fabs(h_ref[i]) : 1e-30;
+        const double rel = fabs(h_output[i] - h_ref[i]) / denom;
         if (rel > max_rel_err) {
             max_rel_err = rel;
             bad_idx = i;
         }
     }
 
-    printf("N = %d, block = %d, grid = %d\n", N, block_size, grid_size);
-    printf("3 kernels total  : %.3f ms (avg over %d iters, 含每轮 max/sum 重置的 memcpy)\n", ms,
-           iters);
-    printf("sum of GPU output: %.6f (should be ~1.0)\n", gpu_sum);
-    printf("max rel error    : %.3e (at i = %d, gpu = %.9e, cpu = %.9e)\n", max_rel_err, bad_idx,
+    printf("  sum of GPU output: %.6f (should be ~1.0)\n", gpu_sum);
+    printf("  max rel error    : %.3e (at i = %d, gpu = %.9e, cpu = %.9e)\n", max_rel_err, bad_idx,
            h_output[bad_idx], h_ref[bad_idx]);
-    printf("%s\n", (max_rel_err < 1e-4 && fabs(gpu_sum - 1.0) < 1e-3) ? "RESULT: PASS"
-                                                                      : "RESULT: FAIL");
+    printf("  %s\n",
+           (max_rel_err < 1e-4 && fabs(gpu_sum - 1.0) < 1e-3) ? "PASS" : "FAIL");
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
     CUDA_CHECK(cudaFree(d_sum));

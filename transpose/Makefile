@@ -8,7 +8,7 @@ BINS := $(SRCS:.cu=)
 
 all: $(BINS)
 
-%: %.cu transpose_common.cuh
+%: %.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 run: all
