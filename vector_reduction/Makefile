@@ -19,13 +19,10 @@ profile: all
 	@for b in $(BINS); do echo "==> profiling $$b"; ncu --set full -f -o $$b ./$$b; done
 
 clean:
-	rm -f $(BINS)
-
-cleanall: clean
-	rm -f *.ncu-rep
+	rm -f $(BINS) *.ncu-rep
 
 # %: %.cu 是 match-anything 规则，产物会被当成中间文件用完自动删掉，
 # 加 .SECONDARY 让二进制留在磁盘上（方便 ncu 直接 profile）
 .SECONDARY: $(BINS)
 
-.PHONY: all run profile clean cleanall
+.PHONY: all run profile clean

@@ -10,6 +10,7 @@
 //
 // 相比 v3：shared memory 用量从 256 个 float 降到 8 个，
 // __syncthreads 从 3 次降到 1 次。
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -65,9 +66,12 @@ __global__ void reduce_v4(const float* in, float* out, int n) {
 int main() {
     const size_t bytes = (size_t)N * sizeof(float);
     float* h_in = (float*)malloc(bytes);
-    for (int i = 0; i < N; ++i) h_in[i] = 1.0f;
+    // 随机输入而不是全 1.0：全 1 时和恰好是 2^24，float 能精确表示，
+    // 任何加法顺序都得到同一个精确值，归约顺序写错了也照样"通过"。
+    srand(0);
+    for (int i = 0; i < N; ++i) h_in[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
 
-    // ---- 1. 先算 CPU 参考 ----
+    // ---- 1. 先算 CPU 参考（double 累加，参考值要比被测值更准）----
     double cpu_sum = 0.0;
     for (int i = 0; i < N; ++i) cpu_sum += h_in[i];
 
@@ -92,12 +96,20 @@ int main() {
     CUDA_CHECK(cudaMemcpy(&gpu_sum, src, sizeof(float), cudaMemcpyDeviceToHost));
 
     // ---- 3. 验证 ----
+    // 零均值输入下 cpu_sum 会相消到接近 0，不能拿它做相对误差的分母。
+    // 用 sum|x_i| 作尺度：树形归约的误差上界正比于它。
+    double scale = 0.0;
+    for (int i = 0; i < N; ++i) scale += fabs((double)h_in[i]);
+    const double tol = 1e-9 * scale;
+    const double diff = fabs((double)gpu_sum - cpu_sum);
+    const bool pass = diff <= tol;
+
     printf("v4 warp shuffle  N = %d\n", N);
-    printf("  cpu = %.1f, gpu = %.1f  ->  %s\n", cpu_sum, (double)gpu_sum,
-           (double)gpu_sum == cpu_sum ? "PASS" : "FAIL");
+    printf("  cpu = %.6f, gpu = %.6f\n", cpu_sum, (double)gpu_sum);
+    printf("  abs diff = %.3e (tol %.3e)  ->  %s\n", diff, tol, pass ? "PASS" : "FAIL");
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     free(h_in);
-    return (double)gpu_sum == cpu_sum ? 0 : 1;
+    return pass ? 0 : 1;
 }

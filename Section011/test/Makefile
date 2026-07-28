@@ -20,5 +20,7 @@ all: 01_naive 02_wmma 03_cutlass 04_cublass
 	$(NVCC) $(ARCH_FLAGS) $(COMMONFLAGS) -DCUTLASS_ARCH_MMA_SM90_SUPPORTED=0 -I$(CUTLASS_DIR)/include -I/mnt/c/Users/hamdy/cuda_course/cutlass/tools/util/include   03_cutlass.cu -o 03_cutlass
 
 clean:
-	rm -f 01_naive 02_wmma 04_cublass 03_cutlass
+	rm -f 01_naive 02_wmma 04_cublass 03_cutlass *.ncu-rep
+
+.PHONY: all clean
 

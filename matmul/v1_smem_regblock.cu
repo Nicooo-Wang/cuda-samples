@@ -12,25 +12,17 @@
 //      载入的 a_frag / b_frag 在寄存器里被复用 TN / TM 次，
 //      TM+TN 次 smem load 换来 TM*TN 次 mma。这是 tensor 利用率能提上去的关键。
 //
+// 注意 smem 没有做 padding：As 的 ld = BK = 32 halfs = 64B，
+// wmma 从 smem 取数时会有 bank conflict。消除它是下一步的事，
+// 这一版先把注意力放在"两级复用"本身。
+//
 // 实测 global load sectors 从 134M 降到 8.4M（÷16），tensor pipe 从 4.4% 升到 29.5%。
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cuda_fp16.h>
 #include <mma.h>
 
+#include "common.h"
+
 using namespace nvcuda;
-
-#define CUDA_CHECK(call)                                                                    \
-    do {                                                                                    \
-        cudaError_t err_ = (call);                                                          \
-        if (err_ != cudaSuccess) {                                                          \
-            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
-            exit(EXIT_FAILURE);                                                             \
-        }                                                                                   \
-    } while (0)
-
-#define CEIL(a, b) (((a) + (b) - 1) / (b))
 
 constexpr int M = 2048, N = 2048, K = 2048;
 constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
@@ -46,12 +38,6 @@ constexpr int NUM_THREADS = WARPS_M * WARPS_N * 32;  // 128
 constexpr int TM = WM / WMMA_M;  // 4
 constexpr int TN = WN / WMMA_N;  // 4
 
-// smem 的 leading dimension 加 padding：
-// 不加的话 As 的 ld = BK = 32 halfs = 64B，wmma 从 smem 按列取数会撞 bank
-constexpr int PAD = 8;
-constexpr int LDA_S = BK + PAD;  // As: BM x LDA_S
-constexpr int LDB_S = BN + PAD;  // Bs: BK x LDB_S
-
 constexpr int ELEMS_PER_LOAD = 8;  // 每次 float4 搬 8 个 half（16B），global load 的最大宽度
 
 __global__ __launch_bounds__(NUM_THREADS) void matmul_v1(const half* __restrict__ A,
@@ -59,8 +45,8 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_v1(const half* __restrict_
                                                          float* __restrict__ C, int m, int n,
                                                          int k) {
     extern __shared__ half smem[];
-    half* As = smem;
-    half* Bs = smem + BM * LDA_S;
+    half* As = smem;             // BM x BK
+    half* Bs = smem + BM * BK;   // BK x BN
 
     const int tid = threadIdx.x;
     const int warp = tid / 32;
@@ -79,12 +65,12 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_v1(const half* __restrict_
         for (int idx = tid; idx < BM * BK / ELEMS_PER_LOAD; idx += NUM_THREADS) {
             const int r = idx / (BK / ELEMS_PER_LOAD);
             const int c = (idx % (BK / ELEMS_PER_LOAD)) * ELEMS_PER_LOAD;
-            *(float4*)&As[r * LDA_S + c] = *(const float4*)&A[(size_t)(block_row + r) * k + k0 + c];
+            *(float4*)&As[r * BK + c] = *(const float4*)&A[(size_t)(block_row + r) * k + k0 + c];
         }
         for (int idx = tid; idx < BK * BN / ELEMS_PER_LOAD; idx += NUM_THREADS) {
             const int r = idx / (BN / ELEMS_PER_LOAD);
             const int c = (idx % (BN / ELEMS_PER_LOAD)) * ELEMS_PER_LOAD;
-            *(float4*)&Bs[r * LDB_S + c] = *(const float4*)&B[(size_t)(k0 + r) * n + block_col + c];
+            *(float4*)&Bs[r * BN + c] = *(const float4*)&B[(size_t)(k0 + r) * n + block_col + c];
         }
         __syncthreads();
 
@@ -95,10 +81,9 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_v1(const half* __restrict_
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[TN];
 
             for (int i = 0; i < TM; ++i)
-                wmma::load_matrix_sync(a_frag[i], &As[(warp_m * WM + i * WMMA_M) * LDA_S + kk],
-                                       LDA_S);
+                wmma::load_matrix_sync(a_frag[i], &As[(warp_m * WM + i * WMMA_M) * BK + kk], BK);
             for (int j = 0; j < TN; ++j)
-                wmma::load_matrix_sync(b_frag[j], &Bs[kk * LDB_S + warp_n * WN + j * WMMA_N], LDB_S);
+                wmma::load_matrix_sync(b_frag[j], &Bs[kk * BN + warp_n * WN + j * WMMA_N], BN);
 
             for (int i = 0; i < TM; ++i)
                 for (int j = 0; j < TN; ++j)
@@ -124,25 +109,14 @@ int main() {
     float* h_C = (float*)malloc(c_elems * sizeof(float));
     float* h_ref = (float*)malloc(c_elems * sizeof(float));
 
-    srand(0);
-    for (size_t i = 0; i < a_elems; ++i) h_A[i] = __float2half((float)rand() / RAND_MAX - 0.5f);
-    for (size_t i = 0; i < b_elems; ++i) h_B[i] = __float2half((float)rand() / RAND_MAX - 0.5f);
+    fill_inputs(h_A, a_elems, h_B, b_elems);
 
     printf("v1 smem tiling + regblock  (M=%d, N=%d, K=%d)\n", M, N, K);
 
     // ---- 1. 先算 CPU 参考 ----
     printf("  [1/2] CPU reference ...\n");
     fflush(stdout);
-    for (size_t i = 0; i < c_elems; ++i) h_ref[i] = 0.0f;
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < M; ++i) {
-        for (int kk = 0; kk < K; ++kk) {
-            const float a = __half2float(h_A[(size_t)i * K + kk]);
-            const half* b_row = h_B + (size_t)kk * N;
-            float* c_row = h_ref + (size_t)i * N;
-            for (int j = 0; j < N; ++j) c_row[j] += a * __half2float(b_row[j]);
-        }
-    }
+    cpu_matmul(h_A, h_B, h_ref, M, N, K);
 
     // ---- 2. 再跑 GPU，单轮 ----
     printf("  [2/2] GPU kernel ...\n");
@@ -157,10 +131,8 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_B, h_B, b_elems * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_C, 0x7F, c_elems * sizeof(float)));
 
-    // 默认 48KB 的静态 smem 上限装不下 42KB 的 tile，需要显式抬高动态 smem 配额
-    const size_t smem_bytes = (size_t)(BM * LDA_S + BK * LDB_S) * sizeof(half);
-    CUDA_CHECK(cudaFuncSetAttribute(matmul_v1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int)smem_bytes));
+    // As (BM×BK) + Bs (BK×BN) = 16KB，在默认的 48KB 静态上限内
+    const size_t smem_bytes = (size_t)(BM * BK + BK * BN) * sizeof(half);
 
     dim3 block(NUM_THREADS);
     dim3 grid(CEIL(N, BN), CEIL(M, BM));
@@ -169,32 +141,12 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpy(h_C, d_C, c_elems * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ---- 3. 精度验证（判据同 v0）----
-    double scale = 0.0;
-    for (size_t i = 0; i < c_elems; ++i) scale = fmax(scale, fabs((double)h_ref[i]));
-    const double rtol = 1e-2, atol = 1e-4 * scale;
-
-    double max_abs = 0.0;
-    size_t bad = 0, first_bad = 0;
-    for (size_t i = 0; i < c_elems; ++i) {
-        const double diff = fabs((double)h_C[i] - (double)h_ref[i]);
-        max_abs = fmax(max_abs, diff);
-        if (!(diff <= atol + rtol * fabs((double)h_ref[i]))) {
-            if (bad == 0) first_bad = i;
-            ++bad;
-        }
-    }
-
-    printf("  max|C| = %.4f, max abs diff = %.3e (atol %.3e, rtol %.0e)  ->  %s\n", scale, max_abs,
-           atol, rtol, bad == 0 ? "PASS" : "FAIL");
-    if (bad != 0) {
-        printf("  %zu / %zu off, first at %zu (row %zu, col %zu): gpu = %f, cpu = %f\n", bad,
-               c_elems, first_bad, first_bad / N, first_bad % N, h_C[first_bad], h_ref[first_bad]);
-    }
+    // ---- 3. 精度验证 ----
+    const bool pass = check_result(h_C, h_ref, M, N);
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
     free(h_A); free(h_B); free(h_C); free(h_ref);
-    return bad == 0 ? 0 : 1;
+    return pass ? 0 : 1;
 }

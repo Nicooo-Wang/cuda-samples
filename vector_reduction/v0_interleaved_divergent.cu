@@ -4,6 +4,7 @@
 // 问题：if (tid % (2 * stride) == 0) 让 warp 内大部分线程闲置。
 // 第一轮 32 个线程里只有 16 个干活，第二轮只剩 8 个……而 warp 是整体调度的，
 // 闲置线程也要陪着走完指令，这就是 warp divergence。
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -44,11 +45,16 @@ int main() {
     const size_t bytes = (size_t)N * sizeof(float);
     float* h_in = (float*)malloc(bytes);
 
-    // 输入全填 1.0：和恰好是 N = 2^24，float 能精确表示，
-    // 所以可以要求 GPU 结果和 CPU 完全相等 —— 漏加一个元素都会被抓出来。
-    for (int i = 0; i < N; ++i) h_in[i] = 1.0f;
+    // 用随机输入而不是全 1.0：全 1 时和恰好是 2^24，float 能精确表示，
+    // 任何加法顺序都得到同一个精确值，归约顺序写错了也照样"通过" ——
+    // 那种判据只能抓漏加元素，抓不到精度问题。
+    // 随机值下树形归约和串行累加的舍入路径不同，才真正在检查数值精度。
+    srand(0);
+    for (int i = 0; i < N; ++i) h_in[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
 
     // ---- 1. 先算 CPU 参考 ----
+    // 用 double 累加：串行加 16M 个 float，float 累加器自身的误差会大到
+    // 淹没被测对象，参考值必须比被测值更准。
     double cpu_sum = 0.0;
     for (int i = 0; i < N; ++i) cpu_sum += h_in[i];
 
@@ -76,12 +82,21 @@ int main() {
     CUDA_CHECK(cudaMemcpy(&gpu_sum, src, sizeof(float), cudaMemcpyDeviceToHost));
 
     // ---- 3. 验证 ----
+    // 输入零均值，cpu_sum 本身会相消到接近 0，拿它当相对误差的分母会炸。
+    // 用 sum|x_i| 作尺度：它是这次归约里被舍入的总量级，
+    // 树形归约的误差上界正比于它（约 eps * log2(N) 倍）。
+    double scale = 0.0;
+    for (int i = 0; i < N; ++i) scale += fabs((double)h_in[i]);
+    const double tol = 1e-9 * scale;  // 实测误差 ~4e-4，scale ~8.4e6，留约一个量级余量
+    const double diff = fabs((double)gpu_sum - cpu_sum);
+    const bool pass = diff <= tol;
+
     printf("v0 interleaved (divergent)  N = %d\n", N);
-    printf("  cpu = %.1f, gpu = %.1f  ->  %s\n", cpu_sum, (double)gpu_sum,
-           (double)gpu_sum == cpu_sum ? "PASS" : "FAIL");
+    printf("  cpu = %.6f, gpu = %.6f\n", cpu_sum, (double)gpu_sum);
+    printf("  abs diff = %.3e (tol %.3e)  ->  %s\n", diff, tol, pass ? "PASS" : "FAIL");
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     free(h_in);
-    return (double)gpu_sum == cpu_sum ? 0 : 1;
+    return pass ? 0 : 1;
 }

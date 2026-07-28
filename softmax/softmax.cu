@@ -140,8 +140,10 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_output, d_output, bytes, cudaMemcpyDeviceToHost));
 
     // ---- 3. 精度验证：softmax 输出量级约 1/N，用相对误差判断 ----
+    // bad_idx 初值取 0 而不是 -1：如果所有元素误差都是 0，-1 会让下面的
+    // h_output[bad_idx] 越界读。
     double max_rel_err = 0.0;
-    int bad_idx = -1;
+    int bad_idx = 0;
     double gpu_sum = 0.0;
     for (int i = 0; i < N; ++i) {
         gpu_sum += h_output[i];
@@ -153,11 +155,11 @@ int main() {
         }
     }
 
+    const bool pass = (max_rel_err < 1e-4 && fabs(gpu_sum - 1.0) < 1e-3);
     printf("  sum of GPU output: %.6f (should be ~1.0)\n", gpu_sum);
     printf("  max rel error    : %.3e (at i = %d, gpu = %.9e, cpu = %.9e)\n", max_rel_err, bad_idx,
            h_output[bad_idx], h_ref[bad_idx]);
-    printf("  %s\n",
-           (max_rel_err < 1e-4 && fabs(gpu_sum - 1.0) < 1e-3) ? "PASS" : "FAIL");
+    printf("  %s\n", pass ? "PASS" : "FAIL");
 
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
@@ -166,5 +168,5 @@ int main() {
     free(h_input);
     free(h_output);
     free(h_ref);
-    return 0;
+    return pass ? 0 : 1;
 }

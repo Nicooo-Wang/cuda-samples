@@ -15,9 +15,6 @@ profile: softmax
 	ncu --set full -f -o softmax ./softmax
 
 clean:
-	rm -f softmax
+	rm -f softmax *.ncu-rep
 
-cleanall: clean
-	rm -f *.ncu-rep
-
-.PHONY: all run profile clean cleanall
+.PHONY: all run profile clean
