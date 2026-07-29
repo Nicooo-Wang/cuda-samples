@@ -1,8 +1,0 @@
-==PROF== Connected to process 44339 (/mnt/c/Users/hamdy/cuda_course/section004/02vectoradd)
-Execution time: 1482.922119 milliseconds
-==PROF== Disconnected from process 44339
-"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
-"0","44339","02vectoradd","127.0.0.1","vectorAdd(int *, int *, int *, int)","1","7","(96, 1, 1)","(349526, 1, 1)","0","8.6","Command line profiler metrics","sm__inst_executed.avg","inst","441506"
-"0","44339","02vectoradd","127.0.0.1","vectorAdd(int *, int *, int *, int)","1","7","(96, 1, 1)","(349526, 1, 1)","0","8.6","Command line profiler metrics","sm__inst_executed.max","inst","463632"
-"0","44339","02vectoradd","127.0.0.1","vectorAdd(int *, int *, int *, int)","1","7","(96, 1, 1)","(349526, 1, 1)","0","8.6","Command line profiler metrics","sm__inst_executed.min","inst","431664"
-"0","44339","02vectoradd","127.0.0.1","vectorAdd(int *, int *, int *, int)","1","7","(96, 1, 1)","(349526, 1, 1)","0","8.6","Command line profiler metrics","sm__inst_executed.sum","inst","16777228"
