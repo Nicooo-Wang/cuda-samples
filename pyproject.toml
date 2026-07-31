@@ -1,0 +1,14 @@
+# 只服务 triton/flash_attention 这类 Python 示例；rmsnorm 等 .cu 算子走 nvcc/Makefile，不依赖这里。
+# 这是一个“非打包”的虚拟项目：uv sync 只把下面依赖装进 .venv，不会去找 Python 包源码。
+[project]
+name = "cuda-course-triton"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.8.0",   # PyPI 默认 wheel 即 cu128 构建，与本机 CUDA 12.8 匹配
+    "triton==3.4.0",
+    "numpy",          # torch 启动时会找 numpy，装上避免无关警告；示例本身不强依赖
+]
+
+[tool.uv]
+package = false

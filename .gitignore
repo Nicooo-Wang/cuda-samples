@@ -1,0 +1,7 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# nsight compute 报告
+*.ncu-rep
