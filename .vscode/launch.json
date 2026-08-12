@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "torchrun: 2 GPUs",
+            "type": "debugpy",
+            "request": "launch",
+
+            "module": "torch.distributed.run",
+
+            "args": [
+                "--standalone",
+                "--nnodes=1",
+                "--nproc-per-node=2",
+
+                "${file}"
+            ],
+
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+
+            "subProcess": true,
+            "justMyCode": true,
+
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "TORCH_DISTRIBUTED_DEBUG": "DETAIL"
+            }
+        }
+    ]
+}
