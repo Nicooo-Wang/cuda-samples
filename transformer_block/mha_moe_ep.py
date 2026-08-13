@@ -12,7 +12,6 @@
     只实例化这 E_local 个 Expert；router(gate) 在各 rank 间复制。
   * token 经 NCCL all_to_all_single 跨 rank 分发到专家所在的 rank，算完再原路
     回收，最后在本地按 router 权重加权求和 —— 正好补上 mha_moe.py 里点名的"无 all-to-all"。
-  * aux loss 用跨 rank 汇总后的全局统计量算（all_reduce）。
 
 输入约定：纯 EP 下，前序（复制型）层给出相同激活，所以每个 rank 的输入 x 完全
 一致；EP 前向在【每个 rank 上都重建出完整 [B,T,C] 输出】（不是分片），残差/下一层
@@ -121,11 +120,10 @@ class Expert(nn.Module):
 
 
 class TopKRouter(nn.Module):
-    """门控路由（EP 版）。与单 rank 版同构，但 aux loss 需要跨 rank 统计量，
-    所以这里只返回路由决策 + 完整概率，全局 aux 在 ExpertParallelMoE 里算。
+    """门控路由（EP 版）。与单 rank 版同构，返回路由决策（topk 权重与专家号）。
 
     forward(flat):  flat [N, C]
-        -> (topk_p [N, k], topk_i [N, k], probs [N, E] fp32)
+        -> (topk_p [N, k], topk_i [N, k])
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -139,19 +137,19 @@ class TopKRouter(nn.Module):
 
     def forward(
         self, flat: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # 输入 flat : [N, C]（N = B*T 个 token）
-        # 输出      : topk_p [N, k]（归一化权重）、topk_i [N, k]（专家号）、probs [N, E]（fp32）
+        # 输出      : topk_p [N, k]（归一化权重）、topk_i [N, k]（专家号）
         # 门控打分：每个 token 得到对 E 个专家的 logits [N, E]
         logits = self.gate(flat)
-        # router 概率用 fp32 算更稳，梯度照样回传到 gate。
+        # router 概率用 fp32 算更稳
         probs = F.softmax(logits, dim=-1, dtype=torch.float32)
         # 取概率最大的 k 个：topk_p 是概率值，topk_i 是对应全局专家号；均 [N, k]
         topk_p, topk_i = torch.topk(probs, k=self.k, dim=-1)
         # 选中的 k 个概率在本 token 内重新归一化，作为加权权重。
         topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        # 权重转回输入 dtype；专家号、完整概率保持原样供 aux loss 使用
-        return topk_p.to(flat.dtype), topk_i, probs
+        # 权重转回输入 dtype；专家号保持原样
+        return topk_p.to(flat.dtype), topk_i
 
 
 class ExpertParallelMoE(nn.Module):
@@ -161,7 +159,7 @@ class ExpertParallelMoE(nn.Module):
     每个 rank 对自己的 N 个 token 独立做门控决策，再通过 all_to_all 把 token 送到
     对应专家所在的 rank，算完原路收回，本地加权求和。最终每个 rank 都得到完整 [B,T,C]。
 
-    前向十步（注释里的 ① ~ ⑩ 与下方代码一一对应）：
+    前向九步（注释里的 ① ~ ⑨ 与下方代码一一对应）：
       ① 本地路由（gate → softmax → topk → renorm）；
       ② 算出每条 (token,slot) 的目的 rank 与目的【本地】专家号；
       ③ 按目的 rank 排序，得到发送顺序 order 与每 rank 发送量 send_counts；
@@ -170,8 +168,7 @@ class ExpertParallelMoE(nn.Module):
       ⑥ all_to_all 发送 token 与本地专家号（变长分段）；
       ⑦ 本地专家计算：按 recv 的本地专家号分组，【写回原位】（保持顺序以便回传对齐）；
       ⑧ all_to_all 把输出原路送回（分段方向取反）；
-      ⑨ 撤销排序 order，按 (token,slot) 乘上权重 topk_p 求和；
-      ⑩ 用全局统计量算 aux loss。
+      ⑨ 撤销排序 order，按 (token,slot) 乘上权重 topk_p 求和。
     """
 
     def __init__(self, cfg: Config, rank: int, world_size: int) -> None:
@@ -194,9 +191,9 @@ class ExpertParallelMoE(nn.Module):
 
     def forward(
         self, x: torch.Tensor, trace: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # 输入  x : [B, T, C]（各 rank 一致）
-        # 输出 out : [B, T, C]（各 rank 一致）；aux_loss : 标量
+        # 输出 out : [B, T, C]（各 rank 一致）
         B, T, C = x.shape                       # 批次 B、序列长 T、隐藏维 C
         N = B * T                               # 本 rank 的 token 总数
         k, W, E_local = self.k, self.world_size, self.E_local  # 别名，简化书写
@@ -205,7 +202,7 @@ class ExpertParallelMoE(nn.Module):
         flat = x.reshape(N, C)                  # [N, C]
 
         # ① 本地路由（每个 rank 对自己的 N 个 token 独立做门控决策）
-        topk_p, topk_i, probs = self.router(flat)          # [N,k], [N,k], [N,E](fp32)
+        topk_p, topk_i = self.router(flat)             # [N,k], [N,k]
 
         # ② 每条 (token,slot) 的目的 rank 与目的本地专家号
         #    约定：专家按 rank 连续切分，rank r 持有全局专家 [r*E_local:(r+1)*E_local]
@@ -287,21 +284,6 @@ class ExpertParallelMoE(nn.Module):
         # 展平回 [B, T, C]
         out = combined.reshape(B, T, C)
 
-        # ⑩ 全局 aux loss：路由统计跨 rank 汇总（all_reduce）
-        # 统计本 rank 上每个全局专家被选中的次数 [E]（共 N*k 次选择），转 fp32
-        local_counts = torch.bincount(topk_i.reshape(-1), minlength=self.E).to(probs.dtype)
-        # 跨 rank 求和 → 全局每个专家的总命中次数 [E]
-        dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
-        # 全局负载比例 = 命中次数 / 全局总选择次数 (W*N*k)；均匀时每个专家 ≈ 1/E
-        g_load = local_counts / (W * N * k)    # [E]
-        # 本 rank 上每个专家的平均路由概率（沿 token 维求均值）[E]
-        local_meanp = probs.mean(dim=0)
-        # 跨 rank 求和再除以 W → 全局平均路由概率 [E]
-        dist.all_reduce(local_meanp, op=dist.ReduceOp.SUM)
-        g_meanp = local_meanp / W              # [E]
-        # 负载均衡损失：E * Σ(平均概率 ⊙ 负载比例)，均匀分布时取最小值；标量
-        aux_loss = self.E * torch.sum(g_meanp * g_load)
-
         if trace and self.rank == 0:
             # 只在 rank0 打印 trace，避免多 rank 重复输出
             print("    [Expert-Parallel MoE]")
@@ -312,10 +294,9 @@ class ExpertParallelMoE(nn.Module):
             print(f"      flat tokens (每 rank)  [{N}, {C}]，每 token 选 k={k} 个专家")
             print(f"      send_counts -> 各 rank {splits}   (本 rank 共发出 {N * k} 条)")
             print(f"      recv_counts <- 各 rank {rsplits}   (本 rank 共接收 {n_recv} 条)")
-            print(f"      aux_loss (全局)        {aux_loss.item():.4f}")
 
-        # 返回 [B, T, C] 输出与标量 aux_loss
-        return out, aux_loss
+        # 返回 [B, T, C] 输出
+        return out
 
 
 class Block(nn.Module):
@@ -335,20 +316,20 @@ class Block(nn.Module):
 
     def forward(
         self, x: torch.Tensor, trace: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 输入  x : [B, T, C]；输出 x : [B, T, C]，aux : 标量
+    ) -> torch.Tensor:
+        # 输入  x : [B, T, C]；输出 x : [B, T, C]
         # 注意力是复制的：各 rank 都算、结果相同，所以只在 rank0 打 trace。
         # 残差1：x + Attention(LayerNorm(x))
         x = x + self.attn(self.norm1(x), trace=trace and self.rank == 0)
-        # MoE 子层：对归一化后的输入做 EP 前向，返回输出与 aux loss
-        moe_out, aux = self.moe(self.norm2(x), trace=trace)
+        # MoE 子层：对归一化后的输入做 EP 前向
+        moe_out = self.moe(self.norm2(x), trace=trace)
         # 残差2：x + MoE(LayerNorm(x))
         x = x + moe_out
-        return x, aux                           # [B, T, C]，标量
+        return x                                # [B, T, C]
 
 
 class TransformerStack(nn.Module):
-    """堆叠 num_layers 个 EP Block；各层 aux_loss（已全局化）求和返回。"""
+    """堆叠 num_layers 个 EP Block。"""
 
     def __init__(self, cfg: Config, rank: int, world_size: int) -> None:
         super().__init__()
@@ -361,17 +342,13 @@ class TransformerStack(nn.Module):
 
     def forward(
         self, x: torch.Tensor, trace: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 输入 x : [B, T, C]；输出 (norm(x) [B,T,C], total_aux 标量)
-        # 标量 0 张量，用于累加各层 aux loss（与 x 同 device/dtype）
-        total_aux = x.new_zeros(())
+    ) -> torch.Tensor:
+        # 输入 x : [B, T, C]；输出 norm(x) [B, T, C]
         # 逐层前向，trace 仅在第 0 层打开
         for i, blk in enumerate(self.blocks):
-            x, aux = blk(x, trace=trace and i == 0)
-            # 累加本层 aux loss（已是全局量）
-            total_aux = total_aux + aux
-        # 返回最终归一化输出与累计 aux loss
-        return self.norm(x), total_aux
+            x = blk(x, trace=trace and i == 0)
+        # 返回最终归一化输出
+        return self.norm(x)
 
 
 def _init_distributed() -> tuple[int, int, int]:
@@ -444,13 +421,12 @@ def main() -> None:
     log(f"input  x : {tuple(x.shape)}   (B, T, C)")
     log("-" * 76)
 
-    # 前向：y 为 [B, T, C] 输出，aux 为标量负载均衡损失；trace 打开第 0 层
-    y, aux = model(x, trace=True)
+    # 前向：y 为 [B, T, C] 输出；trace 打开第 0 层
+    y = model(x, trace=True)
 
     # 以下为 rank0 打印的结果信息
     log("-" * 76)
     log(f"output y : {tuple(y.shape)}   (B, T, C)")
-    log(f"aux_loss (load balance, 全局) = {aux.item():.4f}")
     log(f"y[0, 0, :4] = {[round(v, 4) for v in y[0, 0, :4].tolist()]}")
     log("")
 
