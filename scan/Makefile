@@ -1,15 +1,15 @@
 NVCC     := nvcc
 ARCH     := sm_90
-NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo
+NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda
 
 SRCS := v0_naive_hillis_steele.cu v1_work_efficient.cu v2_bank_conflict_free.cu \
-        v3_arbitrary_length.cu v4_warp_shuffle.cu v5_single_pass_lookback.cu
+        v3_arbitrary_length.cu v4_warp_shuffle.cu v5_single_pass_lookback.cu \
+        v6_striped_load.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
 
-# 每个 .cu 都是自包含的（没有 common.h），单独编译即可跑
-%: %.cu
+%: %.cu common.h
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 run: all

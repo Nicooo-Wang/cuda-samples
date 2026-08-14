@@ -47,25 +47,17 @@
 //
 // 收益：全局访存 4N → 2N（读一次 in、写一次 out，就这样）。
 //   状态数组的流量是 TILES × 8B = 64KB，相比 256MB 可以忽略。
-//   实测 0.132ms / 2034 GB/s，是六版里最快的（v4 是 0.166ms）。
-//   作为参照：这台机器纯拷贝 2N 的极限是 0.035ms，CUB 的 DeviceScan 是 0.10ms——
-//   我们这版已经进到工业级实现的 1.3 倍以内了。
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
+//   实测 0.135ms / 2044 GB/s（v4 是 0.168ms）。
+//   作为参照：这台机器纯拷贝 2N 是 0.073ms / 3694 GB/s，
+//   CUB 的 DeviceScan 是 0.099ms / 2726 GB/s，我们还差 1.36 倍。
+//
+// 差距在哪：不在块内实现，而在 lookback 的等待上。
+//   v6 顺手把这件事量化了——把 lookback 摘掉只需 0.093ms，比 CUB 还快；
+//   lookback 自己吃掉 0.029ms，占 24%。详见 v6 的文件头。
+//   v6 还会修掉这一版载入时的非合并访存（每线程连续拿 VPT 个 float4，
+//   导致相邻 lane 的地址相隔 64 字节，一个 warp 拆成 32 次事务）。
+#include "common.h"
 
-#define CUDA_CHECK(call)                                                                    \
-    do {                                                                                    \
-        cudaError_t err_ = (call);                                                          \
-        if (err_ != cudaSuccess) {                                                          \
-            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
-            exit(EXIT_FAILURE);                                                             \
-        }                                                                                   \
-    } while (0)
-
-constexpr int N     = 1 << 25;    // 32M 个 float = 128MB。这台机器 L2 有 60MB，
-                                  // 输入+输出 256MB 才够把 L2 甩开，否则测的是 L2 带宽不是 HBM
 constexpr int SEG   = 4096;       // 一个 block 负责的分段长度（比 v0~v4 的 1024 大 4 倍，理由见文件头）
 constexpr int TILES = N / SEG;     // 8192 个 block
 constexpr int BLOCK = 256;         // 线程数保持 256
@@ -98,92 +90,6 @@ __device__ __forceinline__ void store_state(TileState* p, float value, int flag)
     s.value = value;
     s.flag  = flag;
     *(volatile unsigned long long*)p = *(unsigned long long*)&s;
-}
-
-// ---------------- 宿主端样板（fill / cpu 参考 / 校验 / 打印，四个独立函数）----------------
-
-// 填 {-2,-1,0,1,2} 的小整数，固定种子保证各版本输入一致、结果可横向对比。
-//
-// 为什么刻意用小整数而不是 [-1,1) 的随机浮点：
-//   前缀和是一次随机游走，量级大约 √N·σ ≈ 8e3，远小于 2^24（float 能精确表示的整数上限）。
-//   于是不管求和顺序怎么变，每一个中间结果都是一个精确的 fp32 整数——
-//   GPU 结果必须和 double 参考【逐位相等】，容差可以直接取 0。
-//   这样任何 FAIL 都一定是真 bug（下标算错、同步漏了），而不是浮点噪声，省掉了调容差的功夫。
-//   对本版格外重要：lookback 的内存序如果写错，错误是偶发的、依赖调度时序的，
-//   有了"必须逐位相等"这条硬标准，跑一次就能抓出来。
-void fill_input(float* in, int n) {
-    srand(0);
-    for (int i = 0; i < n; ++i) in[i] = (float)(rand() % 5 - 2);
-}
-
-// CPU 参考：分段 exclusive scan。每 seg 个元素归零重新开始。
-// 本版传 seg = n，也就是退化成一整条全局 scan。
-void cpu_exclusive_scan(const float* in, float* out, int n, int seg) {
-    double run = 0.0;  // 参考值用 double 累加，比被测的 float 更准
-    for (int i = 0; i < n; ++i) {
-        if (i % seg == 0) run = 0.0;  // 新的一段，前缀清零
-        out[i] = (float)run;          // exclusive：先写"我之前的和"
-        run += in[i];                 // 再把自己算进去
-    }
-}
-
-// 逐位精确比较（见 fill_input 的说明，小整数输入下容差为 0）。
-bool verify(const float* gpu, const float* ref, int n) {
-    double max_diff = 0.0;
-    int first_bad = -1;
-    for (int i = 0; i < n; ++i) {
-        double d = fabs((double)gpu[i] - (double)ref[i]);
-        if (d > max_diff) max_diff = d;
-        if (d != 0.0 && first_bad < 0) first_bad = i;
-    }
-    bool pass = (max_diff == 0.0);
-    printf("  max abs diff    : %.1f", max_diff);
-    if (first_bad >= 0) printf("  (first mismatch at i=%d: gpu=%.1f ref=%.1f)", first_bad,
-                               gpu[first_bad], ref[first_bad]);
-    printf("\n  %s\n", pass ? "PASS" : "FAIL");
-    return pass;
-}
-
-// passes = 这一版实际把整个数组读写了几遍。
-// effective bw 恒按 2N（读一次+写一次，任何 scan 的理论下限）计算——
-// 这是六个版本之间唯一可比的尺子；passes > 2 说明这一版有额外的来回搬运。
-void report_perf(const char* tag, float ms, int passes) {
-    double lower_bound_bytes = 2.0 * N * sizeof(float);
-    printf("  %-16s: %.4f ms\n", tag, ms);
-    printf("  effective bw    : %.1f GB/s   (按下限 2N 算)\n",
-           lower_bound_bytes / (ms * 1e-3) / 1e9);
-    if (passes != 2)
-        printf("  actual traffic  : %.1f GB/s   (实际搬了 %dN)\n",
-               (double)passes * N * sizeof(float) / (ms * 1e-3) / 1e9, passes);
-}
-
-// 计时：先热身一次，再取 5 次里最快的。
-// 为什么要热身：第一次 launch 要付内核加载、页表建立等一次性开销，
-// 实测能比稳定态慢一倍以上——只测一次冷启动，六个版本之间就没法比了。
-// 取最快值而不是平均值：把偶发的调度抖动（别的进程抢 SM）排除掉。
-template <typename Launch>
-float benchmark(Launch launch) {
-    cudaEvent_t ev0, ev1;
-    CUDA_CHECK(cudaEventCreate(&ev0));
-    CUDA_CHECK(cudaEventCreate(&ev1));
-
-    launch();  // 热身，不计时
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    float best = 1e30f;
-    for (int r = 0; r < 5; ++r) {
-        CUDA_CHECK(cudaEventRecord(ev0));
-        launch();
-        CUDA_CHECK(cudaEventRecord(ev1));
-        CUDA_CHECK(cudaEventSynchronize(ev1));
-        float ms = 0.f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
-        if (ms < best) best = ms;
-    }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventDestroy(ev0));
-    CUDA_CHECK(cudaEventDestroy(ev1));
-    return best;
 }
 
 // ---------------- block 内 scan：在 v4 的基础上，每线程多管几个 float4 ----------------
@@ -300,8 +206,12 @@ __global__ void scan_single_pass_kernel(const float4* __restrict__ in, float4* _
     // ---- 1. 先把自己那段扫完 ----
     // 每个线程拿【连续】的 VPT 个 float4（blocked 排布），这样第 ① 层串行扫的
     // 就是自己那 16 个连续元素，语义直接对得上。
-    // （另一种 striped 排布——每个线程取 i*BLOCK+tid——访存更漂亮，
-    //   但线程手里的元素不连续，串行扫出来的前缀就不是这一段的前缀了，结果是错的。）
+    //
+    // 代价是访存不合并：一个 lane 连读 4 个 float4 = 64 字节，相邻 lane 的起始地址
+    // 就相隔 64 字节，一个 warp 的 32 条 lane 没有两条能并进同一个事务。
+    // 直接换成 striped 排布（每个线程取 i*BLOCK+tid）访存漂亮，但线程手里的元素
+    // 不再连续，串行扫出来的前缀就不是这一段的前缀了，结果是错的。
+    // v6 用 shared memory 转置一下解决这个矛盾：载入按 striped、计算按 blocked。
     float4 v[VPT];
     for (int i = 0; i < VPT; ++i) v[i] = in[base4 + threadIdx.x * VPT + i];
     float total = block_scan_float4(v, s_warp);

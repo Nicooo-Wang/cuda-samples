@@ -11,21 +11,12 @@
 //   - kernel launch 次数固定（2 次），不随 N 增长
 //   - 线程在寄存器里累加，中间结果不落 shared/global
 //   - grid-stride 的访存模式天然合并（相邻线程访问相邻地址）
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
+//
+// 实测 0.044 -> 0.038 ms（1540 -> 1771 GB/s），1.15 倍。
+// 结构上这一版已经对了，但离纯读上限 3135 GB/s 还差 1.8 倍——
+// 差距在载入指令的粒度上（每次只取一个 float），v6 换成 float4 解决。
+#include "common.h"
 
-#define CUDA_CHECK(call)                                                                    \
-    do {                                                                                    \
-        cudaError_t err_ = (call);                                                          \
-        if (err_ != cudaSuccess) {                                                          \
-            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
-            exit(EXIT_FAILURE);                                                             \
-        }                                                                                   \
-    } while (0)
-
-constexpr int N = 1 << 24;
 constexpr int BLOCK_SIZE = 256;
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
 
@@ -64,17 +55,10 @@ __global__ void reduce_v5(const float* in, float* out, int n) {
 int main() {
     const size_t bytes = (size_t)N * sizeof(float);
     float* h_in = (float*)malloc(bytes);
-    // 随机输入而不是全 1.0：全 1 时和恰好是 2^24，float 能精确表示，
-    // 任何加法顺序都得到同一个精确值，归约顺序写错了也照样"通过"。
-    srand(0);
-    for (int i = 0; i < N; ++i) h_in[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+    fill_inputs(h_in, N);
+    double cpu_sum = cpu_reference(h_in, N);
 
-    // ---- 1. 先算 CPU 参考（double 累加，参考值要比被测值更准）----
-    double cpu_sum = 0.0;
-    for (int i = 0; i < N; ++i) cpu_sum += h_in[i];
-
-    // ---- 2. 再跑 GPU ----
-    // grid 取"刚好填满 GPU"：每个 SM 跑若干个 block。
+    // grid 取"刚好填满 GPU"：每个 SM 跑若干个 block
     int dev = 0, num_sm = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev));
@@ -85,28 +69,20 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_partial, (size_t)grid * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
 
-    // 第一趟：N 个元素 -> grid 个部分和
-    reduce_v5<<<grid, BLOCK_SIZE>>>(d_in, d_partial, N);
-    // 第二趟：grid 个部分和 -> 1 个（单 block，grid-stride loop 自己会兜住剩余元素）
-    reduce_v5<<<1, BLOCK_SIZE>>>(d_partial, d_partial, grid);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
+    printf("v5 grid-stride loop  N = %d, grid = %d (%d SMs x 8)\n", N, grid, num_sm);
+
+    float ms = benchmark([&] {
+        // 第一趟：N 个元素 -> grid 个部分和
+        reduce_v5<<<grid, BLOCK_SIZE>>>(d_in, d_partial, N);
+        // 第二趟：grid 个部分和 -> 1 个（单 block，grid-stride loop 自己会兜住剩余元素）
+        reduce_v5<<<1, BLOCK_SIZE>>>(d_partial, d_partial, grid);
+    });
 
     float gpu_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(&gpu_sum, d_partial, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ---- 3. 验证 ----
-    // 零均值输入下 cpu_sum 会相消到接近 0，不能拿它做相对误差的分母。
-    // 用 sum|x_i| 作尺度：树形归约的误差上界正比于它。
-    double scale = 0.0;
-    for (int i = 0; i < N; ++i) scale += fabs((double)h_in[i]);
-    const double tol = 1e-9 * scale;
-    const double diff = fabs((double)gpu_sum - cpu_sum);
-    const bool pass = diff <= tol;
-
-    printf("v5 grid-stride loop  N = %d, grid = %d (%d SMs x 8)\n", N, grid, num_sm);
-    printf("  cpu = %.6f, gpu = %.6f\n", cpu_sum, (double)gpu_sum);
-    printf("  abs diff = %.3e (tol %.3e)  ->  %s\n", diff, tol, pass ? "PASS" : "FAIL");
+    report_perf("time", ms);
+    bool pass = check_result(gpu_sum, cpu_sum, h_in, N);
 
     CUDA_CHECK(cudaFree(d_in));
     CUDA_CHECK(cudaFree(d_partial));

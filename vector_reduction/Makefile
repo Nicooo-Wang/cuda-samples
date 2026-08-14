@@ -1,14 +1,15 @@
 NVCC      := nvcc
 ARCH      := sm_90
-NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo
+NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda
 
 SRCS := v0_interleaved_divergent.cu v1_contiguous.cu v2_two_per_thread.cu \
-        v3_warp_unroll.cu v4_warp_shuffle.cu v5_grid_stride.cu
+        v3_warp_unroll.cu v4_warp_shuffle.cu v5_grid_stride.cu \
+        v6_vectorized.cu v7_atomic.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
 
-%: %.cu
+%: %.cu common.h
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 run: all
@@ -21,7 +22,7 @@ profile: all
 clean:
 	rm -f $(BINS) *.ncu-rep
 
-# %: %.cu 是 match-anything 规则，产物会被当成中间文件用完自动删掉，
+# %: %.cu common.h 是 match-anything 规则，产物会被当成中间文件用完自动删掉，
 # 加 .SECONDARY 让二进制留在磁盘上（方便 ncu 直接 profile）
 .SECONDARY: $(BINS)
 

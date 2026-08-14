@@ -10,23 +10,14 @@
 //
 // 相比 v3：shared memory 用量从 256 个 float 降到 8 个，
 // __syncthreads 从 3 次降到 1 次。
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
+//
+// 实测 0.045 -> 0.044 ms（1507 -> 1540 GB/s），只有 2%。
+// 为什么这么小：v3 已经把 barrier 的大头省掉了，剩下的 shared memory 访问
+// 在这个规模下本来就不是瓶颈——真正的瓶颈已经转移到 global 载入上。
+// shuffle 的价值要在别的场景才充分体现（比如 scan 的 v4，那里是 2.7 倍），
+// 这里它更像是为 v5 铺路：warp_reduce 这个原语后面三版都在用。
+#include "common.h"
 
-#define CUDA_CHECK(call)                                                                    \
-    do {                                                                                    \
-        cudaError_t err_ = (call);                                                          \
-        if (err_ != cudaSuccess) {                                                          \
-            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
-            exit(EXIT_FAILURE);                                                             \
-        }                                                                                   \
-    } while (0)
-
-#define CEIL(a, b) (((a) + (b) - 1) / (b))
-
-constexpr int N = 1 << 24;
 constexpr int BLOCK_SIZE = 256;
 constexpr int ELEMS_PER_BLOCK = 2 * BLOCK_SIZE;
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;  // 8
@@ -66,21 +57,29 @@ __global__ void reduce_v4(const float* in, float* out, int n) {
 int main() {
     const size_t bytes = (size_t)N * sizeof(float);
     float* h_in = (float*)malloc(bytes);
-    // 随机输入而不是全 1.0：全 1 时和恰好是 2^24，float 能精确表示，
-    // 任何加法顺序都得到同一个精确值，归约顺序写错了也照样"通过"。
-    srand(0);
-    for (int i = 0; i < N; ++i) h_in[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+    fill_inputs(h_in, N);
+    double cpu_sum = cpu_reference(h_in, N);
 
-    // ---- 1. 先算 CPU 参考（double 累加，参考值要比被测值更准）----
-    double cpu_sum = 0.0;
-    for (int i = 0; i < N; ++i) cpu_sum += h_in[i];
-
-    // ---- 2. 再跑 GPU ----
     float *d_a, *d_b;
     CUDA_CHECK(cudaMalloc(&d_a, bytes));
     CUDA_CHECK(cudaMalloc(&d_b, (size_t)CEIL(N, ELEMS_PER_BLOCK) * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_a, h_in, bytes, cudaMemcpyHostToDevice));
 
+    printf("v4 warp shuffle  N = %d\n", N);
+
+    float ms = benchmark([&] {
+        int cur = N;
+        float *src = d_a, *dst = d_b;
+        while (cur > 1) {
+            const int grid = CEIL(cur, ELEMS_PER_BLOCK);
+            reduce_v4<<<grid, BLOCK_SIZE>>>(src, dst, cur);
+            cur = grid;
+            float* t = src; src = dst; dst = t;
+        }
+    });
+
+    // benchmark 把 d_a/d_b 里的数据弄乱了，重新跑一次完整的归约（不计时）获取正确结果
+    CUDA_CHECK(cudaMemcpy(d_a, h_in, bytes, cudaMemcpyHostToDevice));
     int cur = N;
     float *src = d_a, *dst = d_b;
     while (cur > 1) {
@@ -90,26 +89,16 @@ int main() {
         float* t = src; src = dst; dst = t;
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
 
     float gpu_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(&gpu_sum, src, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ---- 3. 验证 ----
-    // 零均值输入下 cpu_sum 会相消到接近 0，不能拿它做相对误差的分母。
-    // 用 sum|x_i| 作尺度：树形归约的误差上界正比于它。
-    double scale = 0.0;
-    for (int i = 0; i < N; ++i) scale += fabs((double)h_in[i]);
-    const double tol = 1e-9 * scale;
-    const double diff = fabs((double)gpu_sum - cpu_sum);
-    const bool pass = diff <= tol;
-
-    printf("v4 warp shuffle  N = %d\n", N);
-    printf("  cpu = %.6f, gpu = %.6f\n", cpu_sum, (double)gpu_sum);
-    printf("  abs diff = %.3e (tol %.3e)  ->  %s\n", diff, tol, pass ? "PASS" : "FAIL");
+    report_perf("time", ms);
+    bool pass = check_result(gpu_sum, cpu_sum, h_in, N);
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     free(h_in);
     return pass ? 0 : 1;
 }
+

@@ -6,25 +6,15 @@
 //
 // 收益：block 数量减半 -> kernel launch 次数和总的 __syncthreads 次数都减半，
 // 而这一次额外的加法几乎免费（本来就要从 global 读数据，带宽是瓶颈）。
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
+//
+// 实测 0.106 -> 0.062 ms（631 -> 1075 GB/s），1.7 倍。
+// 这个思路可以继续推：每线程 4 个、8 个……但收益会递减，因为省下的是
+// launch 和同步开销，而它们在总时间里的占比越来越小。v5 会把它推到极致
+// （每线程吃掉 N/grid 个元素），那时结构本身也跟着变了。
+#include "common.h"
 
-#define CUDA_CHECK(call)                                                                    \
-    do {                                                                                    \
-        cudaError_t err_ = (call);                                                          \
-        if (err_ != cudaSuccess) {                                                          \
-            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
-            exit(EXIT_FAILURE);                                                             \
-        }                                                                                   \
-    } while (0)
-
-#define CEIL(a, b) (((a) + (b) - 1) / (b))
-
-constexpr int N = 1 << 24;
 constexpr int BLOCK_SIZE = 256;
-constexpr int ELEMS_PER_BLOCK = 2 * BLOCK_SIZE;  // 每个 block 覆盖的元素数
+constexpr int ELEMS_PER_BLOCK = 512;
 
 __global__ void reduce_v2(const float* in, float* out, int n) {
     __shared__ float s[BLOCK_SIZE];
@@ -53,21 +43,29 @@ __global__ void reduce_v2(const float* in, float* out, int n) {
 int main() {
     const size_t bytes = (size_t)N * sizeof(float);
     float* h_in = (float*)malloc(bytes);
-    // 随机输入而不是全 1.0：全 1 时和恰好是 2^24，float 能精确表示，
-    // 任何加法顺序都得到同一个精确值，归约顺序写错了也照样"通过"。
-    srand(0);
-    for (int i = 0; i < N; ++i) h_in[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+    fill_inputs(h_in, N);
+    double cpu_sum = cpu_reference(h_in, N);
 
-    // ---- 1. 先算 CPU 参考（double 累加，参考值要比被测值更准）----
-    double cpu_sum = 0.0;
-    for (int i = 0; i < N; ++i) cpu_sum += h_in[i];
-
-    // ---- 2. 再跑 GPU ----
     float *d_a, *d_b;
     CUDA_CHECK(cudaMalloc(&d_a, bytes));
     CUDA_CHECK(cudaMalloc(&d_b, (size_t)CEIL(N, ELEMS_PER_BLOCK) * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_a, h_in, bytes, cudaMemcpyHostToDevice));
 
+    printf("v2 two per thread  N = %d\n", N);
+
+    float ms = benchmark([&] {
+        int cur = N;
+        float *src = d_a, *dst = d_b;
+        while (cur > 1) {
+            const int grid = CEIL(cur, ELEMS_PER_BLOCK);
+            reduce_v2<<<grid, BLOCK_SIZE>>>(src, dst, cur);
+            cur = grid;
+            float* t = src; src = dst; dst = t;
+        }
+    });
+
+    // benchmark 把 d_a/d_b 里的数据弄乱了，重新跑一次完整的归约（不计时）获取正确结果
+    CUDA_CHECK(cudaMemcpy(d_a, h_in, bytes, cudaMemcpyHostToDevice));
     int cur = N;
     float *src = d_a, *dst = d_b;
     while (cur > 1) {
@@ -77,26 +75,16 @@ int main() {
         float* t = src; src = dst; dst = t;
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
 
     float gpu_sum = 0.0f;
     CUDA_CHECK(cudaMemcpy(&gpu_sum, src, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ---- 3. 验证 ----
-    // 零均值输入下 cpu_sum 会相消到接近 0，不能拿它做相对误差的分母。
-    // 用 sum|x_i| 作尺度：树形归约的误差上界正比于它。
-    double scale = 0.0;
-    for (int i = 0; i < N; ++i) scale += fabs((double)h_in[i]);
-    const double tol = 1e-9 * scale;
-    const double diff = fabs((double)gpu_sum - cpu_sum);
-    const bool pass = diff <= tol;
-
-    printf("v2 two elements per thread  N = %d\n", N);
-    printf("  cpu = %.6f, gpu = %.6f\n", cpu_sum, (double)gpu_sum);
-    printf("  abs diff = %.3e (tol %.3e)  ->  %s\n", diff, tol, pass ? "PASS" : "FAIL");
+    report_perf("time", ms);
+    bool pass = check_result(gpu_sum, cpu_sum, h_in, N);
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     free(h_in);
     return pass ? 0 : 1;
 }
+
