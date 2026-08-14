@@ -14,9 +14,6 @@
 
 using namespace nvcuda;
 
-constexpr int M = 2048, N = 2048, K = 2048;  // C[M,N] = A[M,K] * B[K,N]，全部 row-major
-constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-
 __global__ void matmul_v0(const half* A, const half* B, float* C, int m, int n, int k) {
     const int warp_m = blockIdx.x;                             // M 方向 tile 下标
     const int warp_n = blockIdx.y * blockDim.y + threadIdx.y;  // N 方向 tile 下标
@@ -48,19 +45,10 @@ int main() {
     half* h_B = (half*)malloc(b_elems * sizeof(half));
     float* h_C = (float*)malloc(c_elems * sizeof(float));
     float* h_ref = (float*)malloc(c_elems * sizeof(float));
-
     fill_inputs(h_A, a_elems, h_B, b_elems);
 
     printf("v0 wmma naive  (M=%d, N=%d, K=%d)\n", M, N, K);
-
-    // ---- 1. 先算 CPU 参考 ----
-    printf("  [1/2] CPU reference ...\n");
-    fflush(stdout);
-    cpu_matmul(h_A, h_B, h_ref, M, N, K);
-
-    // ---- 2. 再跑 GPU，单轮 ----
-    printf("  [2/2] GPU kernel ...\n");
-    fflush(stdout);
+    printf("  每 warp 1 个 %dx%d tile，fragment 直接从 global 载入，无 smem\n", WMMA_M, WMMA_N);
 
     half *d_A, *d_B;
     float* d_C;
@@ -69,19 +57,39 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_C, c_elems * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_A, h_A, a_elems * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B, b_elems * sizeof(half), cudaMemcpyHostToDevice));
+
+    // 先借 d_C 让 cuBLAS 算一遍参考结果，拷回主机后这块显存就可以覆盖了
+    cublas_reference(d_A, d_B, d_C, h_ref);
     // 填 sentinel 而不是 0：漏算的 tile 会以 3.4e38 的形式直接暴露，而不是伪装成合理的小数
     CUDA_CHECK(cudaMemset(d_C, 0x7F, c_elems * sizeof(float)));
 
     dim3 block(32, 8);  // block 内 8 个 warp，全部排在 N 方向
     dim3 grid(CEIL(M, WMMA_M), CEIL(CEIL(N, WMMA_N), block.y));
+
+    // CUDA 12 默认 lazy module loading：首次 launch 才把 kernel 模块加载进来，
+    // 这笔一次性开销会整个落在单次计时里。先查一次 kernel 属性触发加载，
+    // 把它挤出计时区间。这不是预热——kernel 本身没执行过，cache 和 TLB 仍然是冷的。
+    cudaFuncAttributes attr;
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, matmul_v0));
+
+    cudaEvent_t beg, end;
+    CUDA_CHECK(cudaEventCreate(&beg));
+    CUDA_CHECK(cudaEventCreate(&end));
+    CUDA_CHECK(cudaEventRecord(beg));
     matmul_v0<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, beg, end));
+    report_perf(ms);
+
     CUDA_CHECK(cudaMemcpy(h_C, d_C, c_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    const bool pass = check_result(h_C, h_ref);
 
-    // ---- 3. 精度验证 ----
-    const bool pass = check_result(h_C, h_ref, M, N);
-
+    CUDA_CHECK(cudaEventDestroy(beg));
+    CUDA_CHECK(cudaEventDestroy(end));
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
