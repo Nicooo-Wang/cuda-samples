@@ -71,10 +71,10 @@ void ex1() {
     printf("\n");
 
     // ---- TODO: 填入你手算的答案 ----
-    const int my_L_2_4  = TODO_INT;  // L(2, 4) = ?
-    const int my_L_7    = TODO_INT;  // L(7)    = ?
-    const int my_size   = TODO_INT;  // size(L)   = ?
-    const int my_cosize = TODO_INT;  // cosize(L) = ?
+    const int my_L_2_4  = 14;  // L(2, 4) = ?
+    const int my_L_7    = 3;  // L(7)    = ?
+    const int my_size   = 15;  // size(L)   = ?
+    const int my_cosize = 15;  // cosize(L) = ?
     // --------------------------------
 
     if (my_L_2_4 == TODO_INT) {
@@ -113,15 +113,15 @@ void ex2() {
     printf("\n  目标: row 2-3 x col 4-7 (2x4 子块)\n");
 
     // ---- TODO step1: A 的逻辑基 ----
-    const int L0 = TODO_INT;  // L_0 = ?
-    const int L1 = TODO_INT;  // L_1 = ?  (提示: = shape_0)
+    const int L0 = 1;  // L_0 = ?
+    const int L1 = 6;  // L_1 = ?  (提示: = shape_0)
     // ---- TODO step2: B 的 shape 与 stride ----
-    const int b_shape_0  = TODO_INT;
-    const int b_shape_1  = TODO_INT;
-    const int b_stride_0 = TODO_INT;  // row 步进 1 -> 1 * L_0
-    const int b_stride_1 = TODO_INT;  // col 步进 1 -> 1 * L_1
+    const int b_shape_0  = 2;
+    const int b_shape_1  = 4;
+    const int b_stride_0 = 1;  // row 步进 1 -> 1 * L_0
+    const int b_stride_1 = 6;  // col 步进 1 -> 1 * L_1
     // ---- TODO step3: 起点偏移 ----
-    const int my_base = TODO_INT;     // = A(2, 4)
+    const int my_base = 20;     // = A(2, 4)
     // --------------------------------------------
 
     if (L0 == TODO_INT || b_shape_0 == TODO_INT || my_base == TODO_INT) {
