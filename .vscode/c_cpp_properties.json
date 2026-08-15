@@ -1,0 +1,78 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "CUDA (nvcc, sm_90)",
+
+            // 主力信息源：仓库根的 compile_commands.json，由
+            // tools/gen_compile_commands.py 从各教程的 Makefile 抓出来。
+            // 每个 .cu 的 -I / -std / -arch 都跟 Makefile 一致。
+            "compileCommands": "${workspaceFolder}/compile_commands.json",
+
+            // 下面这些是 compile_commands 里查不到该文件时的兜底
+            // （比如 common.h、cutlass 头文件本身、或新加还没重新生成的 .cu）。
+            "compilerPath": "/usr/local/cuda/bin/nvcc",
+            "compilerArgs": [
+                "-std=c++17",
+                "-arch=sm_90",
+                "--extended-lambda"
+            ],
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/third-party/cutlass/include",
+                "${workspaceFolder}/third-party/cutlass/tools/util/include",
+                "${workspaceFolder}/third-party/cutlass/examples/common",
+                "/usr/local/cuda/include"
+            ],
+
+            // nvcc 编译 .cu 时会隐式 `-include cuda_runtime.h`（nvcc --dryrun 可见），
+            // IntelliSense 不走 nvcc 前端，所以这里手动补上，
+            // threadIdx / blockIdx / __syncthreads 才不会飘红。
+            "forcedInclude": [
+                "/usr/local/cuda/include/cuda_runtime.h"
+            ],
+
+            // cuda_runtime.h 里大量内容藏在 #if defined(__CUDACC__) 后面，
+            // 不定义这些宏的话 __device__ / __global__ 和设备侧函数都看不见。
+            //
+            // 这份列表照抄 nvcc 自己的 host 预处理 pass（`nvcc --dryrun` 的第一行 gcc）。
+            // 特别注意：**不要**加 __CUDA_ARCH__。它会让 cute/config.hpp 把 CUTE_UNROLL
+            // 展开成裸的 `#pragma unroll`（那条分支是给 nvcc 前端准备的，而且不像
+            // CUTLASS_PRAGMA_UNROLL 那样留了 __INTELLISENSE__ 出口），非 nvcc 前端会当场
+            // 报一大片 stray '#'，解析一断跳转就跟着废掉。实测：加了 147 处报错，去掉归零。
+            "defines": [
+                "__CUDACC__",
+                "__NVCC__",
+                "__CUDA_ARCH_LIST__=900",
+                "__CUDACC_VER_MAJOR__=12",
+                "__CUDACC_VER_MINOR__=8",
+                "__CUDACC_EXTENDED_LAMBDA__"
+            ],
+
+            "browse": {
+                // Go to Symbol / 全局符号索引的扫描范围。
+                // cutlass 的 include 树有 800+ 头文件，明确列出来比让它扫整个
+                // third-party（含 test/、python/）快得多。
+                "path": [
+                    "${workspaceFolder}/cute",
+                    "${workspaceFolder}/cutlass",
+                    "${workspaceFolder}/matmul",
+                    "${workspaceFolder}/rmsnorm",
+                    "${workspaceFolder}/scan",
+                    "${workspaceFolder}/softmax",
+                    "${workspaceFolder}/transpose",
+                    "${workspaceFolder}/vector_reduction",
+                    "${workspaceFolder}/flash_attention",
+                    "${workspaceFolder}/third-party/cutlass/include",
+                    "${workspaceFolder}/third-party/cutlass/tools/util/include",
+                    "/usr/local/cuda/include"
+                ],
+                "limitSymbolsToIncludedHeaders": false,
+                "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db"
+            }
+        }
+    ]
+}

@@ -1,7 +1,40 @@
-# Python / uv
+# ---- 编译产物 ----
+# 各教程的 Makefile 把 vN_xxx.cu 编译成【同名的无扩展名可执行文件】
+# （v0_naive.cu -> v0_naive）。与其每加一个版本就来这里补一行文件名，
+# 直接把这些目录整体忽略掉，再用 ! 把带扩展名的源码（.cu / .h / .md）放回来。
+#
+# 注意下面几条 ! 的位置：gitignore 里【后写的规则优先】，
+# 所以 !*.* 必须写在这一段里，而 *.pyc / *.ncu-rep 那两条要排在它后面，
+# 否则 !*.* 会把它们又重新纳入跟踪。
+matmul/*
+scan/*
+vector_reduction/*
+transpose/*
+rmsnorm/*
+softmax/*/*
+cute/*/*
+# cute/xxx/exercises/ 比上面深一层。目录被 cute/*/* 挡住的话 git 根本不会往里走，
+# 里面写什么 ! 规则都不生效，所以先把目录本身放回来（末尾 / = 只匹配目录），
+# 再单独忽略它里面的内容。
+!cute/*/*/
+cute/*/*/*
+!*.*
+!*/Makefile
+!*/*/Makefile
+!*/*/*/Makefile
+
+# ---- Python / uv ----
 .venv/
 __pycache__/
 *.pyc
 
-# nsight compute 报告
+# ---- nsight compute 报告 ----
 *.ncu-rep
+
+# ---- VS Code ----
+# compile_commands.json 由 tools/gen_compile_commands.py 从各 Makefile 生成
+# （make 的时候自动刷新），是派生产物，不入库。
+# 注意这两条必须排在 !*.* 后面，否则会被它重新纳入跟踪。
+/compile_commands.json
+# cpptools 的符号索引数据库，240MB 量级，千万别提交
+.vscode/browse.vc.db*

@@ -1,0 +1,38 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // 正常情况下用不到：各教程的 Makefile 已经 include 了
+            // tools/compile_commands.mk，每次 make 都会自动刷新。
+            // 这个任务留给"不想编译、只想让跳转先跟上"的场合。
+            // Ctrl+Shift+P -> Tasks: Run Task -> 刷新 compile_commands.json
+            "label": "刷新 compile_commands.json",
+            "type": "shell",
+            "command": "python3 tools/gen_compile_commands.py",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            // 编译当前打开的 .cu 所在教程目录
+            "label": "make（当前文件所在目录）",
+            "type": "shell",
+            "command": "make",
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            // nvcc 的 host 端报错格式跟 gcc 一样，直接复用 cpptools 提供的 $gcc
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}

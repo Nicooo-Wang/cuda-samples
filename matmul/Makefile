@@ -34,3 +34,6 @@ clean:
 .SECONDARY: $(BINS)
 
 .PHONY: all run profile clean
+
+# 顺手刷新仓库根的 compile_commands.json（VS Code 跳转用），细节见该文件注释
+include ../tools/compile_commands.mk

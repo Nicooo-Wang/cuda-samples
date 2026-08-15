@@ -1,296 +1,209 @@
-// v2: local_partition - 线程到数据的映射
+// v2: local_tile 与 local_partition —— 两级切分范式
 //
-// ========== 什么是 Partition？ ==========
-//
-// 在 GPU 编程中，我们经常需要回答这个问题：
-//   "每个线程应该处理哪些数据？"
-//
-// CuTe 的 local_partition 函数就是用来回答这个问题的！
-//
-// local_partition(tensor, thread_layout, thread_id)
-//   → 返回属于 thread_id 的数据子集（一个新的 Tensor view）
-//
-// ========== Thread Layout 的概念 ==========
-//
-// Thread Layout 描述了线程的组织方式：
-//   - 有多少个线程？（Shape）
-//   - 线程如何编号？（Stride）
-//
-// 例如：
-//   auto thr_layout = make_layout(Int<32>{});  // 32 个线程，线性编号
-//
-// ========== Partition 的工作原理 ==========
-//
-// 给定：
-//   - 数据 Tensor: shape = (M, N)
-//   - 线程数量: 32
-//
-// local_partition 会：
-//   1. 将数据平均分配给每个线程
-//   2. 返回每个线程的"视图"（view）
-//   3. 不同线程的 view 访问不同的数据（无重叠）
-//
-// 关键：partition 后的 Tensor 仍然指向原始数据，只是改变了索引方式！
-//
-// ========== 为什么需要 Partition？ ==========
-//
-// 传统方式：
-//   int tid = threadIdx.x;
-//   for (int i = tid; i < N; i += blockDim.x) {
-//       data[i] = ...;  // 手动计算线程到数据的映射
-//   }
-//
-// CuTe 方式：
-//   auto my_data = local_partition(tensor, thr_layout, tid);
-//   for (int i = 0; i < size(my_data); ++i) {
-//       my_data(i) = ...;  // 自动映射，简洁清晰
-//   }
+// 概念讲解见 ../README.md §3 §4 §5。本文件验证：
+//   - local_tile 取块：各块 layout 相同、起点在指针上
+//   - local_tile 底下就是 zipped_divide (composition 的封装)
+//   - local_partition 分线程：thr_layout 决定分配模式
+//   - thr_layout 写错会静默出错 (每个线程拿到相同数据)
+//   - tile -> partition 两级范式
 
 #include <cute/tensor.hpp>
+
 #include "common.h"
 
 using namespace cute;
 
-// ========== Kernel 1: 基础 Partition ==========
-__global__ void kernel_basic_partition() {
-    constexpr int N = 64;
-    constexpr int THREADS = 8;
-    __shared__ float smem[N];
+int main() {
+    print_separator("local_tile 与 local_partition");
 
-    int tid = threadIdx.x;
-    if (tid >= THREADS) return;
+    // ========== 1. local_tile 取块 ==========
+    print_separator("1. local_tile: 把大 Tensor 切成块");
 
-    // 创建一个 1D Tensor
-    auto layout = make_layout(Int<N>{});
-    auto tensor = make_tensor(make_smem_ptr(smem), layout);
+    constexpr int BM = 8, BN = 8;
+    float big[BM * BN];
+    for (int i = 0; i < BM * BN; ++i) big[i] = i;
 
-    // 创建线程布局：8 个线程
-    auto thr_layout = make_layout(Int<THREADS>{});
+    auto BT = make_tensor(make_gmem_ptr(big),
+                          make_layout(make_shape(Int<BM>{}, Int<BN>{}),
+                                      make_stride(Int<BN>{}, Int<1>{})));
+    printf("BT = ");
+    print(BT);
+    printf("   (8x8, 值 0-63)\n");
 
-    // Partition: 将 tensor 分配给当前线程
-    auto my_partition = local_partition(tensor, thr_layout, tid);
+    auto tile_shape = make_shape(Int<4>{}, Int<4>{});
+    auto t00 = local_tile(BT, tile_shape, make_coord(0, 0));
+    auto t01 = local_tile(BT, tile_shape, make_coord(0, 1));
+    auto t11 = local_tile(BT, tile_shape, make_coord(1, 1));
 
-    if (tid == 0) {
-        device_print_separator("Kernel 1: 基础 Partition");
-        printf("原始 tensor: size = %d\n", int(size(tensor)));
-        printf("线程数: %d\n", THREADS);
-        printf("每个线程的 partition size = %d\n\n", int(size(my_partition)));
-    }
+    printf("\n切成 4x4 的块:\n");
+    printf("  块(0,0) layout=");
+    print(t00.layout());
+    printf("  首元素=%.0f\n", float(t00(0, 0)));
+    printf("  块(0,1) layout=");
+    print(t01.layout());
+    printf("  首元素=%.0f\n", float(t01(0, 0)));
+    printf("  块(1,1) layout=");
+    print(t11.layout());
+    printf("  首元素=%.0f\n", float(t11(0, 0)));
 
-    // 每个线程初始化自己的数据
-    for (int i = 0; i < size(my_partition); ++i) {
-        my_partition(i) = tid * 100.0f + i;
-    }
+    printf("\n关键观察: 三个块的 layout 完全相同, 只有首元素不同\n");
+    printf("  => 块的位置记在指针上, 不在 Layout 里\n");
+    printf("  => 好处: 处理每个块的代码可以完全一致\n");
 
-    __syncthreads();
+    printf("\n块(1,1) 的内容 (原矩阵 row 4-7 x col 4-7):\n");
+    print_tensor(t11);
 
-    // Thread 0 打印所有数据
-    if (tid == 0) {
-        printf("结果（每个线程负责 %d 个元素）:\n", int(size(my_partition)));
-        for (int t = 0; t < THREADS; ++t) {
-            printf("  Thread %d: ", t);
-            for (int i = 0; i < 8; ++i) {
-                printf("%.0f ", tensor(t * int(size(my_partition)) + i));
-            }
-            printf("\n");
-        }
-    }
-}
+    // ========== 2. local_tile 背后是 composition ==========
+    print_separator("2. local_tile 底下就是 zipped_divide");
 
-// ========== Kernel 2: 2D Partition ==========
-template <int M, int N, int THREADS>
-__global__ void kernel_2d_partition() {
-    __shared__ float smem[M * N];
-    int tid = threadIdx.x;
-    if (tid >= THREADS) return;
+    auto zipped = zipped_divide(BT, tile_shape);
+    printf("zipped_divide(BT, (4,4)) = ");
+    print(zipped.layout());
+    printf("\n");
+    printf("  嵌套结构: ((块内坐标), (块号))\n");
+    printf("    mode0 = ");
+    print(get<0>(zipped.layout()));
+    printf("   <- 块内怎么走\n");
+    printf("    mode1 = ");
+    print(get<1>(zipped.layout()));
+    printf("   <- 块与块之间怎么走\n");
+    printf("       row 方向跳 32 = 4 行 x 行距 8 ; col 方向跳 4\n");
+    printf("\nlocal_tile(BT, tile, coord) 就是: 把块号固定成 coord, 留下块内部分\n");
+    printf("这正是 Section 01 §3.4 讲的嵌套 layout 的实际用途\n");
 
-    // 创建 2D Tensor
-    auto layout = make_layout(make_shape(Int<M>{}, Int<N>{}),
-                              make_stride(Int<N>{}, Int<1>{}));
-    auto tensor = make_tensor(make_smem_ptr(smem), layout);
-
-    // 线程布局
-    auto thr_layout = make_layout(Int<THREADS>{});
-
-    // Partition
-    auto my_data = local_partition(tensor, thr_layout, tid);
-
-    if (tid == 0) {
-        device_print_separator("Kernel 2: 2D Partition");
-        printf("2D Tensor: %d × %d = %d 元素\n", M, N, M*N);
-        printf("线程数: %d\n", THREADS);
-        printf("每个线程: %d 元素\n\n", int(size(my_data)));
-    }
-
-    // 每个线程初始化自己的部分
-    for (int i = 0; i < size(my_data); ++i) {
-        my_data(i) = tid * 10.0f + i;
-    }
-
-    __syncthreads();
-
-    if (tid == 0) {
-        printf("前 4 行结果:\n");
-        for (int i = 0; i < 4; ++i) {
-            printf("  ");
-            for (int j = 0; j < N; ++j) {
-                printf("%4.0f ", tensor(i, j));
-            }
-            printf("\n");
-        }
-    }
-}
-
-// ========== Kernel 3: 理解 Partition 的映射关系 ==========
-__global__ void kernel_partition_mapping() {
-    constexpr int N = 32;
-    constexpr int THREADS = 4;
-    __shared__ float smem[N];
-
-    int tid = threadIdx.x;
-    if (tid >= THREADS) return;
-
-    auto tensor = make_tensor(make_smem_ptr(smem), make_layout(Int<N>{}));
-    auto thr_layout = make_layout(Int<THREADS>{});
-    auto my_part = local_partition(tensor, thr_layout, tid);
-
-    if (tid == 0) {
-        device_print_separator("Kernel 3: Partition 映射关系");
-        printf("演示：partition 如何将数据分配给线程\n\n");
-    }
-
-    __syncthreads();
-
-    // 每个线程打印自己负责的索引
-    printf("Thread %d 负责的全局索引: ", tid);
-    for (int i = 0; i < size(my_part); ++i) {
-        // 计算在原始 tensor 中的索引
-        // 这里我们通过写入唯一值来验证
-        my_part(i) = tid * 100.0f + i;
-    }
+    printf("\ndivide 家族的三种打包方式:\n");
+    printf("  zipped_divide = ");
+    print(zipped_divide(BT, tile_shape).layout());
+    printf("\n  tiled_divide  = ");
+    print(tiled_divide(BT, tile_shape).layout());
+    printf("\n  flat_divide   = ");
+    print(flat_divide(BT, tile_shape).layout());
     printf("\n");
 
-    __syncthreads();
+    printf("\ntiler 也可以只切一部分维度:\n");
+    auto strip = local_tile(BT, make_shape(Int<2>{}, Int<8>{}), make_coord(1, 0));
+    printf("  local_tile(BT, (2,8), (1,0)) = ");
+    print(strip.layout());
+    printf("  首元素=%.0f\n", float(strip(0, 0)));
+    printf("  <- 按行条带切分, 取 row 2-3\n");
 
-    if (tid == 0) {
-        printf("\n完整数据 (按 thread_id 区分):\n");
-        for (int i = 0; i < N; ++i) {
-            if (i % 8 == 0) printf("  ");
-            printf("%5.0f ", smem[i]);
-            if ((i+1) % 8 == 0) printf("\n");
-        }
+    // ========== 3. local_partition 分线程 ==========
+    print_separator("3. local_partition: 把数据分给线程");
+
+    constexpr int VN = 16;
+    float v[VN];
+    for (int i = 0; i < VN; ++i) v[i] = i;
+    auto VT = make_tensor(make_gmem_ptr(v), make_layout(Int<VN>{}, Int<1>{}));
+
+    printf("16 个元素 (值 0-15) 分给 4 个线程, thr_layout = 4:1\n\n");
+    auto thr4 = make_layout(Int<4>{}, Int<1>{});
+    for (int tid = 0; tid < 4; ++tid) {
+        auto p = local_partition(VT, thr4, tid);
+        printf("  tid=%d 拿到: ", tid);
+        for (int i = 0; i < size(p); ++i) printf("%2.0f ", float(p(i)));
+        printf("\n");
     }
-}
+    printf("\n注意: 每个线程拿到的是**跨步的** 4 个, 不是连续的 4 个\n");
+    printf("  => 同一轮里 4 个线程访问下标 0,1,2,3 —— 跨线程连续 = 合并访存\n");
+    printf("  => 这正是 GPU 想要的默认行为\n");
 
-// ========== Kernel 4: 实际应用 - 向量加法 ==========
-template <int N, int THREADS>
-__global__ void vector_add_with_partition(const float* A, const float* B, float* C) {
-    int tid = threadIdx.x;
-    if (tid >= THREADS) return;
+    printf("\npartition 的 layout 就是 thr_layout 的 complement:\n");
+    auto p0 = local_partition(VT, thr4, 0);
+    printf("  local_partition(VT, 4:1, 0).layout = ");
+    print(p0.layout());
+    printf("\n  complement(4:1, 16)                = ");
+    print(complement(thr4, Int<VN>{}));
+    printf("\n  <- 印证 Section 01 §4: complement 不是理论, 它就是 partition 的实现\n");
 
-    // 创建 global memory tensors
-    auto layout = make_layout(Int<N>{});
-    auto tA = make_tensor(A, layout);
-    auto tB = make_tensor(B, layout);
-    auto tC = make_tensor(C, layout);
+    // ========== 4. thr_layout 陷阱 ==========
+    print_separator("4. 陷阱: thr_layout 写错会静默出错");
 
-    // 线程布局
-    auto thr_layout = make_layout(Int<THREADS>{});
-
-    // Partition: 每个线程得到自己的数据视图
-    auto my_A = local_partition(tA, thr_layout, tid);
-    auto my_B = local_partition(tB, thr_layout, tid);
-    auto my_C = local_partition(tC, thr_layout, tid);
-
-    // 每个线程只处理自己的数据
-    for (int i = 0; i < size(my_A); ++i) {
-        my_C(i) = my_A(i) + my_B(i);
+    printf("把 thr_layout 从 4:1 换成 4:4:\n\n");
+    auto thr_bad = make_layout(Int<4>{}, Int<4>{});
+    for (int tid = 0; tid < 4; ++tid) {
+        auto p = local_partition(VT, thr_bad, tid);
+        printf("  tid=%d 拿到: ", tid);
+        for (int i = 0; i < size(p); ++i) printf("%2.0f ", float(p(i)));
+        printf("\n");
     }
+    printf("\n四个线程拿到完全相同的元素!\n");
+    printf("  - 12 个元素从没被碰过\n");
+    printf("  - 4 个元素被重复写 4 次 (race condition)\n");
+    printf("  - 不报错、不警告, 跑起来只是结果不对\n");
+    printf("\n=> 记住: thr_layout 的 stride 通常应该是 1 (线程连续编号)\n");
+    printf("   这是 partition 最常见的错误来源, 且极难调试\n");
 
-    if (tid == 0 && blockIdx.x == 0) {
-        device_print_separator("Kernel 4: 向量加法");
-        printf("使用 partition 简化线程到数据的映射\n");
-        printf("每个线程处理 %d 个元素\n", int(size(my_A)));
+    // ========== 5. 2D partition ==========
+    print_separator("5. 2D 线程布局");
+
+    auto thr2d = make_layout(make_shape(Int<2>{}, Int<4>{}), make_stride(Int<4>{}, Int<1>{}));
+    printf("thr_layout = ");
+    print(thr2d);
+    printf("   (2x4 = 8 个线程)\n\n");
+    for (int tid = 0; tid < 4; ++tid) {
+        auto p = local_partition(BT, thr2d, tid);
+        printf("  tid=%d layout=", tid);
+        print(p.layout());
+        printf("  首元素=%.0f\n", float(p(0, 0)));
     }
-}
+    printf("\n同样是 layout 相同、首元素不同的模式\n");
+    printf("相邻 tid 首元素差 1 => 沿最后一维连续 => 合并访存友好\n");
 
-int main() {
-    print_separator("CuTe local_partition");
+    // ========== 6. 两级范式 ==========
+    print_separator("6. 标准范式: tile -> partition");
 
-    // ========== 1. 基础 Partition ==========
-    print_separator("1. 基础 1D Partition");
-    kernel_basic_partition<<<1, 32>>>();
-    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("真实 kernel 里这两个算子几乎总是连用:\n\n");
+    printf("  1) CTA 层: local_tile 取出本 block 负责的块\n");
+    printf("  2) Thread 层: local_partition 取出本线程负责的元素\n");
+    printf("  3) 直接对结果读写, 下标都算好了\n\n");
 
-    // ========== 2. 2D Partition ==========
-    print_separator("2. 2D Tensor Partition");
-    kernel_2d_partition<8, 8, 16><<<1, 32>>>();
-    CUDA_CHECK(cudaDeviceSynchronize());
+    auto blk = local_tile(BT, tile_shape, make_coord(1, 0));
+    printf("1) local_tile(BT, (4,4), (1,0)) = ");
+    print(blk.layout());
+    printf("  首元素=%.0f\n", float(blk(0, 0)));
 
-    // ========== 3. 映射关系 ==========
-    print_separator("3. Partition 映射关系");
-    kernel_partition_mapping<<<1, 32>>>();
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ========== 4. 实际应用：向量加法 ==========
-    print_separator("4. 向量加法应用");
-
-    constexpr int N = 256;
-    constexpr int THREADS = 32;
-
-    float *h_A = (float*)malloc(N * sizeof(float));
-    float *h_B = (float*)malloc(N * sizeof(float));
-    float *h_C = (float*)malloc(N * sizeof(float));
-
-    for (int i = 0; i < N; ++i) {
-        h_A[i] = i;
-        h_B[i] = i * 2.0f;
-    }
-
-    float *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc(&d_A, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_B, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_C, N * sizeof(float)));
-
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, N * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, N * sizeof(float), cudaMemcpyHostToDevice));
-
-    vector_add_with_partition<N, THREADS><<<1, THREADS>>>(d_A, d_B, d_C);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_C, d_C, N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // 验证
-    bool pass = true;
-    for (int i = 0; i < N; ++i) {
-        if (h_C[i] != h_A[i] + h_B[i]) {
-            pass = false;
-            printf("Error at %d: %.1f + %.1f = %.1f (expected %.1f)\n",
-                   i, h_A[i], h_B[i], h_C[i], h_A[i] + h_B[i]);
-            break;
-        }
+    auto thr22 = make_layout(make_shape(Int<2>{}, Int<2>{}), make_stride(Int<2>{}, Int<1>{}));
+    printf("2) 再 partition 给 2x2 = 4 个线程:\n");
+    for (int tid = 0; tid < 4; ++tid) {
+        auto mine = local_partition(blk, thr22, tid);
+        printf("   tid=%d layout=", tid);
+        print(mine.layout());
+        printf("  值: ");
+        for (int j = 0; j < size<1>(mine); ++j)
+            for (int i = 0; i < size<0>(mine); ++i) printf("%.0f ", float(mine(i, j)));
+        printf("\n");
     }
 
-    printf("\n验证前 8 个结果:\n");
-    for (int i = 0; i < 8; ++i) {
-        printf("  %.1f + %.1f = %.1f\n", h_A[i], h_B[i], h_C[i]);
-    }
-    printf("正确性: %s\n", pass ? "PASS ✓" : "FAIL ✗");
+    printf("\n这个两级结构对应 GPU 的两级并行 (grid 里的 block, block 里的 thread)\n");
+    printf("而两级都只是 view 变换, 没有任何数据搬运\n");
 
-    // ========== 总结 ==========
-    print_separator("总结");
-    printf("关键概念:\n");
-    printf("  • local_partition(tensor, thr_layout, tid)\n");
-    printf("  • 自动将数据分配给每个线程\n");
-    printf("  • 返回的是 view，不拷贝数据\n");
-    printf("  • 简化了线程到数据的映射逻辑\n");
-    printf("\n下一步:\n");
-    printf("  capstone 会用 partition 实现完整的矩阵-向量乘法\n");
+    // ========== 7. make_fragment_like ==========
+    print_separator("7. 寄存器 Tensor: make_fragment_like");
 
-    free(h_A); free(h_B); free(h_C);
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_C));
+    auto mine = local_partition(blk, thr22, 0);
+    printf("mine 的 layout          = ");
+    print(mine.layout());
+    printf("   (指向大数组, stride 跨得远)\n");
+
+    auto frag_like = make_tensor_like(mine);
+    auto frag = make_fragment_like(mine);
+    printf("make_tensor_like(mine)   = ");
+    print(frag_like.layout());
+    printf("\n");
+    printf("make_fragment_like(mine) = ");
+    print(frag.layout());
+    printf("\n");
+    printf("\n两者都丢掉了原来的跨步 stride, 换成紧密排布\n");
+    printf("  => 新数据是独立的一小块, 没必要跨步\n");
+    printf("  => make_fragment_like 保证第一维 stride=1, 最利于向量化和寄存器分配\n");
+    printf("  => 用途: 累加器等临时缓冲 (Section 05 的 MMA 会用到)\n");
+
+    print_separator("小结");
+    printf("  - local_tile(T, tile, coord): 取第 coord 块, 各块 layout 相同\n");
+    printf("  - local_partition(T, thr, tid): 分给线程, thr 的 stride 通常取 1\n");
+    printf("  - 两者都是 view, 零拷贝\n");
+    printf("  - tile -> partition 是 CuTe kernel 的标准骨架\n");
+    printf("\n下一步: capstone 用这套工具实现 GEMV\n");
 
     return 0;
 }

@@ -32,3 +32,6 @@ clean:
 	rm -f $(V1) $(V2) $(V3) $(V4) $(V5) $(V6) *.ncu-rep
 
 .PHONY: all run profile clean
+
+# 顺手刷新仓库根的 compile_commands.json（VS Code 跳转用），细节见该文件注释
+include ../../tools/compile_commands.mk

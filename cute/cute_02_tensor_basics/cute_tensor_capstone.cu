@@ -1,287 +1,217 @@
-// capstone: 矩阵-向量乘法 (GEMV) 使用 CuTe Tensor
+// capstone: 用 Tensor + partition 实现 GEMV
 //
-// 综合应用：
-//   1. 使用 Tensor 描述矩阵和向量
-//   2. 使用 local_partition 分配线程工作
-//   3. 使用 shared memory 优化访问
-//   4. 对比不同实现的性能
+// 问题: y = A * x    A: MxN row-major, x: N, y: M
 //
-// 问题：y = A * x
-//   A: M × N 矩阵 (row-major)
-//   x: N × 1 向量
-//   y: M × 1 向量
-//
-// 每个元素: y[i] = sum(A[i][j] * x[j]) for j in [0, N)
+// 四个版本对比:
+//   v0 baseline   传统 CUDA, 手写下标
+//   v1 cute naive 用 Tensor 索引, 验证零开销
+//   v2 cute smem  把 x 缓存到 shared memory
+//   v3 cute part  用 local_tile + local_partition (README §5 的两级范式)
 
 #include <cute/tensor.hpp>
+
 #include "common.h"
 
 using namespace cute;
 
-// ========== Baseline: 传统 CUDA 实现 ==========
-__global__ void gemv_baseline(const float* A, const float* x, float* y, int M, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= M) return;
+constexpr int M = 4096;
+constexpr int N = 512;
+constexpr int BLOCK = 256;
 
+// ---------- v0: 传统 CUDA ----------
+__global__ void gemv_baseline(const float* A, const float* x, float* y, int m, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m) return;
     float sum = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        sum += A[i * N + j] * x[j];
-    }
+    for (int j = 0; j < n; ++j) sum += A[i * n + j] * x[j];
     y[i] = sum;
 }
 
-// ========== Version 1: CuTe Tensor (naive) ==========
-template <int M, int N>
+// ---------- v1: CuTe Tensor 索引 ----------
 __global__ void gemv_cute_naive(const float* A, const float* x, float* y) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M) return;
 
-    // 创建 Tensors
-    auto layout_A = make_layout(make_shape(Int<M>{}, Int<N>{}),
-                                make_stride(Int<N>{}, Int<1>{}));
-    auto layout_x = make_layout(Int<N>{});
-    auto layout_y = make_layout(Int<M>{});
+    auto tA = make_tensor(make_gmem_ptr(A), make_layout(make_shape(Int<M>{}, Int<N>{}),
+                                                        make_stride(Int<N>{}, Int<1>{})));
+    auto tx = make_tensor(make_gmem_ptr(x), make_layout(Int<N>{}));
+    auto ty = make_tensor(make_gmem_ptr(y), make_layout(Int<M>{}));
 
-    auto tA = make_tensor(A, layout_A);
-    auto tx = make_tensor(x, layout_x);
-    auto ty = make_tensor(y, layout_y);
-
-    // 计算 y[i]
     float sum = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        sum += tA(i, j) * tx(j);
-    }
+    for (int j = 0; j < N; ++j) sum += tA(i, j) * tx(j);
     ty(i) = sum;
 }
 
-// ========== Version 2: CuTe with Shared Memory ==========
-template <int M, int N, int THREADS>
+// ---------- v2: x 缓存到 shared memory ----------
 __global__ void gemv_cute_smem(const float* A, const float* x, float* y) {
     __shared__ float smem_x[N];
-
     int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
 
-    // 创建 global memory tensors
-    auto layout_A = make_layout(make_shape(Int<M>{}, Int<N>{}),
-                                make_stride(Int<N>{}, Int<1>{}));
-    auto tA = make_tensor(A, layout_A);
-    auto tx_gmem = make_tensor(x, make_layout(Int<N>{}));
+    auto tA = make_tensor(make_gmem_ptr(A), make_layout(make_shape(Int<M>{}, Int<N>{}),
+                                                        make_stride(Int<N>{}, Int<1>{})));
+    auto gx = make_tensor(make_gmem_ptr(x), make_layout(Int<N>{}));
+    auto sx = make_tensor(make_smem_ptr(smem_x), make_layout(Int<N>{}));
 
-    // 创建 shared memory tensor
-    auto tx_smem = make_tensor(make_smem_ptr(smem_x), make_layout(Int<N>{}));
-
-    // 使用 partition 协作加载 x 到 shared memory
-    auto thr_layout = make_layout(Int<THREADS>{});
-    auto my_x = local_partition(tx_smem, thr_layout, tid);
-    auto my_x_gmem = local_partition(tx_gmem, thr_layout, tid);
-
-    for (int j = 0; j < size(my_x); ++j) {
-        my_x(j) = my_x_gmem(j);
-    }
+    // 用 partition 协作把 x 搬进 smem (thr_layout stride 取 1 -> 合并访存)
+    auto thr = make_layout(Int<BLOCK>{}, Int<1>{});
+    auto my_dst = local_partition(sx, thr, tid);
+    auto my_src = local_partition(gx, thr, tid);
+    for (int k = 0; k < size(my_dst); ++k) my_dst(k) = my_src(k);
 
     __syncthreads();
 
-    // 计算 y[i] (从 shared memory 读取 x)
     if (i < M) {
         float sum = 0.0f;
-        for (int j = 0; j < N; ++j) {
-            sum += tA(i, j) * tx_smem(j);
-        }
+        for (int j = 0; j < N; ++j) sum += tA(i, j) * sx(j);
         y[i] = sum;
     }
 }
 
-// ========== Version 3: CuTe with Partition for A ==========
-template <int M, int N, int BLOCK_SIZE>
+// ---------- v3: local_tile + local_partition 两级范式 ----------
 __global__ void gemv_cute_partition(const float* A, const float* x, float* y) {
     __shared__ float smem_x[N];
-
     int tid = threadIdx.x;
 
-    // Global tensors
-    auto layout_A = make_layout(make_shape(Int<M>{}, Int<N>{}),
-                                make_stride(Int<N>{}, Int<1>{}));
-    auto tA = make_tensor(A, layout_A);
-    auto tx_gmem = make_tensor(x, make_layout(Int<N>{}));
-    auto ty = make_tensor(y, make_layout(Int<M>{}));
+    auto tA = make_tensor(make_gmem_ptr(A), make_layout(make_shape(Int<M>{}, Int<N>{}),
+                                                        make_stride(Int<N>{}, Int<1>{})));
+    auto gx = make_tensor(make_gmem_ptr(x), make_layout(Int<N>{}));
+    auto ty = make_tensor(make_gmem_ptr(y), make_layout(Int<M>{}));
+    auto sx = make_tensor(make_smem_ptr(smem_x), make_layout(Int<N>{}));
 
-    // Shared tensor for x
-    auto tx_smem = make_tensor(make_smem_ptr(smem_x), make_layout(Int<N>{}));
+    auto thr = make_layout(Int<BLOCK>{}, Int<1>{});
 
-    // Load x to smem using partition
-    auto thr_layout = make_layout(Int<BLOCK_SIZE>{});
-    auto my_x = local_partition(tx_smem, thr_layout, tid);
-    auto my_x_gmem = local_partition(tx_gmem, thr_layout, tid);
-
-    for (int j = 0; j < size(my_x); ++j) {
-        my_x(j) = my_x_gmem(j);
-    }
-
+    // 阶段 1: 协作加载 x -> smem
+    auto my_dst = local_partition(sx, thr, tid);
+    auto my_src = local_partition(gx, thr, tid);
+    for (int k = 0; k < size(my_dst); ++k) my_dst(k) = my_src(k);
     __syncthreads();
 
-    // Partition A by rows
-    auto my_rows = local_partition(tA, thr_layout, tid);
-    auto my_y = local_partition(ty, thr_layout, tid);
+    // 阶段 2: local_tile 取出本 block 负责的 BLOCK 行 (A 的行条带 + y 的分段)
+    auto blkA = local_tile(tA, make_shape(Int<BLOCK>{}, Int<N>{}), make_coord(blockIdx.x, 0));
+    auto blky = local_tile(ty, make_shape(Int<BLOCK>{}), make_coord(blockIdx.x));
 
-    // 每个线程处理若干行
-    for (int row_idx = 0; row_idx < size(my_y); ++row_idx) {
+    // 阶段 3: 每个线程负责本块中的一行
+    auto myA = local_partition(blkA, make_layout(make_shape(Int<BLOCK>{}, Int<1>{}),
+                                                 make_stride(Int<1>{}, Int<1>{})),
+                               tid);
+    auto myy = local_partition(blky, thr, tid);
+
+    for (int r = 0; r < size(myy); ++r) {
         float sum = 0.0f;
-        for (int j = 0; j < N; ++j) {
-            sum += my_rows(row_idx, j) * tx_smem(j);
-        }
-        my_y(row_idx) = sum;
+        for (int j = 0; j < N; ++j) sum += myA(r, j) * sx(j);
+        myy(r) = sum;
     }
 }
 
-// ========== 性能测试 ==========
-template <typename Kernel>
-float benchmark(Kernel kernel, dim3 grid, dim3 block, int warmup, int iters) {
-    for (int i = 0; i < warmup; ++i) {
-        kernel<<<grid, block>>>();
-    }
+// ---------- 计时 ----------
+template <class Fn>
+float bench(Fn launch, int warmup = 5, int iters = 100) {
+    for (int i = 0; i < warmup; ++i) launch();
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    CUDA_CHECK(cudaEventRecord(start));
-    for (int i = 0; i < iters; ++i) {
-        kernel<<<grid, block>>>();
-    }
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    cudaEvent_t s, e;
+    CUDA_CHECK(cudaEventCreate(&s));
+    CUDA_CHECK(cudaEventCreate(&e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) launch();
+    CUDA_CHECK(cudaEventRecord(e));
+    CUDA_CHECK(cudaEventSynchronize(e));
 
     float ms;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
+    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+    CUDA_CHECK(cudaEventDestroy(s));
+    CUDA_CHECK(cudaEventDestroy(e));
     return ms / iters;
 }
 
-// 验证函数
-void verify(const float* y, const float* y_ref, int M) {
-    bool pass = true;
+static bool verify(const float* got, const float* ref) {
+    double worst = 0.0;
+    int bad = -1;
     for (int i = 0; i < M; ++i) {
-        if (fabs(y[i] - y_ref[i]) > 1e-3) {
-            printf("Mismatch at %d: %.3f vs %.3f\n", i, y[i], y_ref[i]);
-            pass = false;
-            break;
+        double d = fabs((double)got[i] - (double)ref[i]);
+        if (d > worst) {
+            worst = d;
+            if (d > 1e-2) bad = i;
         }
     }
-    printf("验证: %s\n", pass ? "PASS ✓" : "FAIL ✗");
+    printf("  max abs diff = %.3e -> %s\n", worst, bad < 0 ? "PASS" : "FAIL");
+    if (bad >= 0) printf("  first bad at %d: got %.4f ref %.4f\n", bad, got[bad], ref[bad]);
+    return bad < 0;
 }
 
 int main() {
-    print_separator("CuTe Tensor Capstone: GEMV");
+    print_separator("Section 02 Capstone: GEMV");
+    printf("y = A * x   A: %d x %d,  block = %d\n", M, N, BLOCK);
 
-    constexpr int M = 4096;
-    constexpr int N = 512;
-    constexpr int BLOCK_SIZE = 256;
+    float* hA = (float*)malloc((size_t)M * N * sizeof(float));
+    float* hx = (float*)malloc(N * sizeof(float));
+    float* hy = (float*)malloc(M * sizeof(float));
+    float* href = (float*)malloc(M * sizeof(float));
 
-    printf("问题规模: y = A * x\n");
-    printf("  A: %d × %d\n", M, N);
-    printf("  x: %d × 1\n", N);
-    printf("  y: %d × 1\n", M);
+    srand(0);
+    for (size_t i = 0; i < (size_t)M * N; ++i) hA[i] = (float)rand() / RAND_MAX - 0.5f;
+    for (int i = 0; i < N; ++i) hx[i] = (float)rand() / RAND_MAX - 0.5f;
 
-    // 分配和初始化
-    float *h_A = (float*)malloc(M * N * sizeof(float));
-    float *h_x = (float*)malloc(N * sizeof(float));
-    float *h_y = (float*)malloc(M * sizeof(float));
-    float *h_y_ref = (float*)malloc(M * sizeof(float));
-
-    for (int i = 0; i < M * N; ++i) h_A[i] = (rand() % 100) / 100.0f;
-    for (int i = 0; i < N; ++i) h_x[i] = (rand() % 100) / 100.0f;
-
-    // CPU 参考实现
-    print_separator("CPU 参考实现");
+    printf("\nCPU 参考 ...\n");
     for (int i = 0; i < M; ++i) {
-        float sum = 0.0f;
-        for (int j = 0; j < N; ++j) {
-            sum += h_A[i * N + j] * h_x[j];
-        }
-        h_y_ref[i] = sum;
+        double s = 0.0;
+        for (int j = 0; j < N; ++j) s += (double)hA[(size_t)i * N + j] * hx[j];
+        href[i] = (float)s;
     }
-    printf("CPU 计算完成\n");
 
-    // GPU 内存分配
-    float *d_A, *d_x, *d_y;
-    CUDA_CHECK(cudaMalloc(&d_A, M * N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_x, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_y, M * sizeof(float)));
+    float *dA, *dx, *dy;
+    CUDA_CHECK(cudaMalloc(&dA, (size_t)M * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dx, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dy, M * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dA, hA, (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dx, hx, N * sizeof(float), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, M * N * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_x, h_x, N * sizeof(float), cudaMemcpyHostToDevice));
+    dim3 block(BLOCK), grid((M + BLOCK - 1) / BLOCK);
 
-    dim3 block(BLOCK_SIZE);
-    dim3 grid((M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    auto run = [&](const char* name, auto launch) {
+        print_separator(name);
+        CUDA_CHECK(cudaMemset(dy, 0, M * sizeof(float)));
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hy, dy, M * sizeof(float), cudaMemcpyDeviceToHost));
+        bool ok = verify(hy, href);
+        float t = bench(launch);
+        printf("  时间: %.4f ms\n", t);
+        return ok ? t : -1.0f;
+    };
 
-    // ========== Version 0: Baseline ==========
-    print_separator("Version 0: Baseline");
-    gemv_baseline<<<grid, block>>>(d_A, d_x, d_y, M, N);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_y, d_y, M * sizeof(float), cudaMemcpyDeviceToHost));
-    verify(h_y, h_y_ref, M);
+    float t0 = run("v0 baseline", [&] { gemv_baseline<<<grid, block>>>(dA, dx, dy, M, N); });
+    float t1 = run("v1 cute naive", [&] { gemv_cute_naive<<<grid, block>>>(dA, dx, dy); });
+    float t2 = run("v2 cute + smem", [&] { gemv_cute_smem<<<grid, block>>>(dA, dx, dy); });
+    float t3 = run("v3 cute + tile/partition",
+                   [&] { gemv_cute_partition<<<grid, block>>>(dA, dx, dy); });
 
-    auto time0 = benchmark([=]() { gemv_baseline<<<grid, block>>>(d_A, d_x, d_y, M, N); },
-                           grid, block, 5, 100);
-    printf("时间: %.3f ms\n", time0);
+    print_separator("性能汇总");
+    const double bytes = (double)M * N * sizeof(float);
+    auto row = [&](const char* n, float t) {
+        if (t < 0) {
+            printf("  %-26s  FAILED\n", n);
+        } else {
+            printf("  %-26s  %.4f ms   %.1f GB/s   %.2fx\n", n, t, bytes / (t * 1e-3) / 1e9,
+                   t0 / t);
+        }
+    };
+    row("v0 baseline", t0);
+    row("v1 cute naive", t1);
+    row("v2 cute + smem", t2);
+    row("v3 cute + tile/partition", t3);
 
-    // ========== Version 1: CuTe Naive ==========
-    print_separator("Version 1: CuTe Naive");
-    gemv_cute_naive<M, N><<<grid, block>>>(d_A, d_x, d_y);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_y, d_y, M * sizeof(float), cudaMemcpyDeviceToHost));
-    verify(h_y, h_y_ref, M);
+    printf("\nGEMV 是访存瓶颈 (每个 A 元素只用一次), 所以几版差距不大 —— 这本身\n");
+    printf("就是结论: CuTe 的抽象是零开销的, 写得更清楚不等于跑得更慢。\n");
 
-    auto time1 = benchmark([=]() { gemv_cute_naive<M, N><<<grid, block>>>(d_A, d_x, d_y); },
-                           grid, block, 5, 100);
-    printf("时间: %.3f ms (%.1fx vs baseline)\n", time1, time0/time1);
-
-    // ========== Version 2: CuTe + Shared Memory ==========
-    print_separator("Version 2: CuTe + Shared Memory");
-    gemv_cute_smem<M, N, BLOCK_SIZE><<<grid, block>>>(d_A, d_x, d_y);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_y, d_y, M * sizeof(float), cudaMemcpyDeviceToHost));
-    verify(h_y, h_y_ref, M);
-
-    auto time2 = benchmark([=]() { gemv_cute_smem<M, N, BLOCK_SIZE><<<grid, block>>>(d_A, d_x, d_y); },
-                           grid, block, 5, 100);
-    printf("时间: %.3f ms (%.1fx vs baseline)\n", time2, time0/time2);
-
-    // ========== Version 3: CuTe + Partition ==========
-    print_separator("Version 3: CuTe + Partition");
-    gemv_cute_partition<M, N, BLOCK_SIZE><<<grid, block>>>(d_A, d_x, d_y);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_y, d_y, M * sizeof(float), cudaMemcpyDeviceToHost));
-    verify(h_y, h_y_ref, M);
-
-    auto time3 = benchmark([=]() { gemv_cute_partition<M, N, BLOCK_SIZE><<<grid, block>>>(d_A, d_x, d_y); },
-                           grid, block, 5, 100);
-    printf("时间: %.3f ms (%.1fx vs baseline)\n", time3, time0/time3);
-
-    // ========== 总结 ==========
-    print_separator("性能总结");
-    printf("实现           时间(ms)   相对性能\n");
-    printf("Baseline       %.3f     1.00x\n", time0);
-    printf("CuTe Naive     %.3f     %.2fx\n", time1, time0/time1);
-    printf("CuTe + Smem    %.3f     %.2fx\n", time2, time0/time2);
-    printf("CuTe + Part    %.3f     %.2fx\n", time3, time0/time3);
-
-    print_separator("关键收获");
-    printf("✓ CuTe Tensor 提供了清晰的抽象，代码更易读\n");
-    printf("✓ local_partition 简化了线程到数据的映射\n");
-    printf("✓ 零开销抽象：性能和手写 CUDA 相当或更好\n");
-    printf("✓ Shared memory 优化在 CuTe 中依然有效\n");
-    printf("\n恭喜！你已经掌握了 CuTe Tensor 的核心用法\n");
-    printf("下一个教程: cute_03_copy_atom 会介绍数据搬运的抽象\n");
-
-    free(h_A); free(h_x); free(h_y); free(h_y_ref);
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_x));
-    CUDA_CHECK(cudaFree(d_y));
-
+    free(hA);
+    free(hx);
+    free(hy);
+    free(href);
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dx));
+    CUDA_CHECK(cudaFree(dy));
     return 0;
 }

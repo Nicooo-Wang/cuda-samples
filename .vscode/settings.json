@@ -1,0 +1,55 @@
+{
+    // ---- .cu / .cuh 必须走 cuda-cpp ----
+    // cpptools 只对 c / cpp / cuda-cpp 这三个 language id 提供 IntelliSense。
+    // 你装的 kriegalex.vscode-cudacpp 把 .cu/.cuh 注册成了 language id "cuda"，
+    // 那个 id 只有语法高亮，没有跳转，所以这里显式抢回 cuda-cpp。
+    "files.associations": {
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp",
+        "*.h": "cpp",
+        "*.hpp": "cpp",
+        "*.inl": "cpp"
+    },
+
+    // ---- IntelliSense ----
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+    "C_Cpp.intelliSenseEngine": "default",
+
+    // cutlass 模板极深，飘红多半是 IntelliSense 前端跟不上 nvcc，而不是真错。
+    // 保留跳转和补全，但不要满屏红波浪线；真正的编译错误看 make 输出。
+    "C_Cpp.errorSquiggles": "disabled",
+
+    // 打开 .cu 时不要偷偷往 files.associations 里塞 cpp 映射，
+    // 否则会把上面的 cuda-cpp 覆盖掉。
+    "C_Cpp.autoAddFileAssociations": false,
+
+    // 索引缓存放 /tmp，别污染仓库
+    "C_Cpp.intelliSenseCachePath": "/tmp/vscode-cpptools-cache-cuda-course",
+
+    // 编译产物是无扩展名的可执行文件，排除掉可以让符号索引少扫一大堆二进制
+    "C_Cpp.files.exclude": {
+        "**/.vscode": true,
+        "**/.venv": true,
+        "**/third-party/cutlass/test": true,
+        "**/third-party/cutlass/python": true,
+        "**/third-party/cutlass/media": true,
+        "**/third-party/cutlass/docs": true
+    },
+
+    // ---- 资源管理器 / 搜索降噪 ----
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/.vscode/browse.vc.db*": true
+    },
+    "search.exclude": {
+        "**/third-party": true,
+        "**/.venv": true,
+        "**/*.ncu-rep": true,
+        "compile_commands.json": true
+    },
+
+    // 跳进 cutlass 头文件时别手滑改了 submodule
+    "files.readonlyInclude": {
+        "**/third-party/cutlass/**": true
+    }
+}
