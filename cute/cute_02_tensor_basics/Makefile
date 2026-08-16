@@ -4,7 +4,8 @@ CUTLASS_DIR := ../../third-party/cutlass
 NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda \
              -I$(CUTLASS_DIR)/include
 
-SRCS := cute_tensor_v0.cu cute_tensor_v1.cu cute_tensor_v2.cu cute_tensor_capstone.cu
+SRCS := cute_tensor_v0.cu cute_tensor_v1.cu cute_tensor_v2.cu cute_tensor_v3.cu \
+        cute_tensor_capstone.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
@@ -21,6 +22,9 @@ run: all
 	@echo ""
 	@echo "========== v2: local_partition =========="
 	@./cute_tensor_v2
+	@echo ""
+	@echo "========== v3: local_partition 拆解 =========="
+	@./cute_tensor_v3
 	@echo ""
 	@echo "========== capstone: GEMV =========="
 	@./cute_tensor_capstone

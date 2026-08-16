@@ -74,13 +74,13 @@ void ex1() {
     printf("\n");
 
     // ---- TODO ----
-    const float my_T_2_3 = TODO_F;   // T(2,3) 的值
-    const int my_size = TODO_INT;    // size(T)
-    const int my_rank = TODO_INT;    // rank(T)
-    const char* my_row1 = "";        // T(1,_) 的 layout，格式如 "(_6):(_1)"
-    const float my_row1_first = TODO_F;  // T(1,_) 的第一个元素
-    const char* my_col2 = "";        // T(_,2) 的 layout
-    const float my_col2_first = TODO_F;  // T(_,2) 的第一个元素
+    const float my_T_2_3 = 15;   // T(2,3) 的值
+    const int my_size = 24;    // size(T)
+    const int my_rank = 2;    // rank(T)
+    const char* my_row1 = "(_6):(_1)";        // T(1,_) 的 layout，格式如 "(_6):(_1)"
+    const float my_row1_first = 6;  // T(1,_) 的第一个元素
+    const char* my_col2 = "(_4):(_6)";        // T(_,2) 的 layout
+    const float my_col2_first = 2;  // T(_,2) 的第一个元素
     // --------------
 
     if (my_T_2_3 == TODO_F) {
@@ -122,8 +122,8 @@ void ex2() {
                                      make_stride(Int<6>{}, Int<1>{})));
 
     // ---- TODO ----
-    const float my_v23_after_T = TODO_F;  // 执行 T(3,5) = -1.0f 后, g_v[23] = ?
-    const float my_v23_after_r = TODO_F;  // 再执行 r(5) = -2.0f (r = T(3,_)) 后, g_v[23] = ?
+    const float my_v23_after_T = -1.0f;  // 执行 T(3,5) = -1.0f 后, g_v[23] = ?
+    const float my_v23_after_r = -2.0f;  // 再执行 r(5) = -2.0f (r = T(3,_)) 后, g_v[23] = ?
     // --------------
 
     if (my_v23_after_T == TODO_F) {
@@ -163,10 +163,10 @@ void ex3() {
     auto tile = make_shape(Int<4>{}, Int<4>{});
 
     // ---- TODO ----
-    const int my_num_tiles = TODO_INT;   // 一共几块? (8/4) x (12/4)
-    const float my_t12_first = TODO_F;   // local_tile(BT, (4,4), (1,2)) 的首元素
-    const char* my_t12_layout = "";      // 它的 layout
-    const int same_as_t00 = TODO_INT;    // 和 (0,0) 块 layout 相同吗? 1=是 0=否
+    const int my_num_tiles = 6;   // 一共几块? (8/4) x (12/4)
+    const float my_t12_first = 56;   // local_tile(BT, (4,4), (1,2)) 的首元素
+    const char* my_t12_layout = "(_4,_4):(_12,_1)";      // 它的 layout
+    const int same_as_t00 = 1;    // 和 (0,0) 块 layout 相同吗? 1=是 0=否
     // --------------
 
     auto t00 = local_tile(BT, tile, make_coord(0, 0));
@@ -212,10 +212,10 @@ void ex4() {
 
     // ---- TODO: 填 tid=0 和 tid=1 拿到的第一个元素 ----
     // 三种 thr_layout: (1) 8:1   (2) 8:4   (3) 4:1
-    const int t0_of[3] = {TODO_INT, TODO_INT, TODO_INT};  // 各自 tid=0 的首元素
-    const int t1_of[3] = {TODO_INT, TODO_INT, TODO_INT};  // 各自 tid=1 的首元素
+    const int t0_of[3] = {0, 0, 0};  // 各自 tid=0 的首元素
+    const int t1_of[3] = {1, 4, 1};  // 各自 tid=1 的首元素
     // ---- TODO: 哪个 thr_layout 有问题(线程间重复)? 填序号 1/2/3 ----
-    const int broken_one = TODO_INT;
+    const int broken_one = 2;
     // -------------------------------------------------------------
 
     auto a = make_layout(Int<8>{}, Int<1>{});
@@ -279,9 +279,9 @@ void ex5() {
                                       make_stride(Int<8>{}, Int<1>{})));
 
     // ---- TODO ----
-    const float my_blk_first = TODO_F;  // local_tile(BT,(4,4),(0,1)) 的首元素
+    const float my_blk_first = 4;  // local_tile(BT,(4,4),(0,1)) 的首元素
     // tid=3 在 2x2 线程布局下拿到的 4 个值 (按 (i,j) 遍历顺序: (0,0)(1,0)(0,1)(1,1))
-    const int my_tid3[4] = {TODO_INT, TODO_INT, TODO_INT, TODO_INT};
+    const int my_tid3[4] = {13, 29, 15, 31};
     // --------------
 
     auto blk = local_tile(BT, make_shape(Int<4>{}, Int<4>{}), make_coord(0, 1));
