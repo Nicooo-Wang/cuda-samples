@@ -277,6 +277,163 @@ void ex6() {
     CUDA_CHECK(cudaFree(d_out));
 }
 
+// ===========================================================================
+// 练习 7 — 向量化到底要求什么 ★★☆
+//
+// 三个候选 layout，哪些能用 128bit atom 沿连续方向向量化？
+// 填一个 3 位的 bitmask:
+//   bit0 = make_stride(N, 1)              全动态
+//   bit1 = make_stride(N, Int<1>{})       只有末维 stride 静态
+//   bit2 = make_stride(Int<16>{}, Int<1>{}) 全静态
+//
+// 先想: CuTe 要在编译期证明"这 4 个元素相邻"。这件事由 shape 决定还是 stride 决定？
+// ===========================================================================
+constexpr int EX7_MASK = 0;  // TODO
+
+// 只有能向量化的 layout 才能实例化这个 kernel。
+// 全动态那个如果传进来会编译失败 —— 所以下面只实例化你认为可以的。
+template <class TensorS, class TensorD, class TiledCopy>
+__global__ void ex7_kernel(TensorS S, TensorD D, TiledCopy tc) {
+    auto thr = tc.get_slice(threadIdx.x);
+    copy(tc, thr.partition_S(S), thr.partition_D(D));
+}
+
+void ex7() {
+    printf("\n--- 练习 7: 向量化要求什么 ---\n");
+    constexpr int M = 8, N = 16, NE = M * N;
+
+    float *d_s, *d_d;
+    CUDA_CHECK(cudaMalloc(&d_s, NE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_d, NE * sizeof(float)));
+    float hs[NE], hd[NE];
+    for (int i = 0; i < NE; ++i) hs[i] = float(i);
+    CUDA_CHECK(cudaMemcpy(d_s, hs, sizeof(hs), cudaMemcpyHostToDevice));
+
+    auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
+                              make_layout(make_shape(Int<8>{}, Int<4>{}),
+                                          make_stride(Int<4>{}, Int<1>{})),
+                              make_layout(make_shape(Int<1>{}, Int<4>{})));
+
+    int m_rt = M, n_rt = N;
+
+    // 候选 1: 末维 stride 静态, shape 动态
+    auto lay1 = make_layout(make_shape(m_rt, n_rt), make_stride(n_rt, Int<1>{}));
+    CUDA_CHECK(cudaMemset(d_d, 0xff, NE * sizeof(float)));
+    ex7_kernel<<<1, 32>>>(make_tensor(make_gmem_ptr(d_s), lay1),
+                          make_tensor(make_gmem_ptr(d_d), lay1), tc);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(hd, d_d, sizeof(hd), cudaMemcpyDeviceToHost));
+    bool ok1 = true;
+    for (int i = 0; i < NE; ++i)
+        if (hd[i] != hs[i]) ok1 = false;
+
+    // 候选 2: 全静态
+    auto lay2 = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<N>{}, Int<1>{}));
+    CUDA_CHECK(cudaMemset(d_d, 0xff, NE * sizeof(float)));
+    ex7_kernel<<<1, 32>>>(make_tensor(make_gmem_ptr(d_s), lay2),
+                          make_tensor(make_gmem_ptr(d_d), lay2), tc);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(hd, d_d, sizeof(hd), cudaMemcpyDeviceToHost));
+    bool ok2 = true;
+    for (int i = 0; i < NE; ++i)
+        if (hd[i] != hs[i]) ok2 = false;
+
+    // 候选 0 (全动态) 编译不过 —— 想验证的话把下面两行取消注释, 看报错:
+    // auto lay0 = make_layout(make_shape(m_rt, n_rt), make_stride(n_rt, 1));
+    // ex7_kernel<<<1,32>>>(make_tensor(make_gmem_ptr(d_s), lay0), ..., tc);
+
+    printf("  stride(N, Int<1>{})       -> 编译通过, 搬运%s\n", ok1 ? "正确" : "错误");
+    printf("  stride(Int<N>{}, Int<1>{}) -> 编译通过, 搬运%s\n", ok2 ? "正确" : "错误");
+    printf("  stride(N, 1) 全动态        -> 编译失败 (见代码注释)\n");
+
+    expect("两个 stride 静态的都搬对了", ok1 && ok2);
+    expect("EX7_MASK == 0b110", EX7_MASK == 0b110);
+
+    CUDA_CHECK(cudaFree(d_s));
+    CUDA_CHECK(cudaFree(d_d));
+}
+
+// ===========================================================================
+// 练习 8 — 把 layout 从 kernel 里搬到 host ★★☆
+//
+// 下面是"kernel 内构造"的老写法, 它把 layout 写死成了 stride (16,1)。
+//
+// 但 ex8() 里真实的数据是 8x16 嵌在一个**行 stride 为 20** 的缓冲区里
+// (每行 16 个有效元素 + 4 个填充)。所以这个 kernel 现在读的是错的位置。
+//
+// 改成 README §4 的分工:
+//   1. kernel 签名改成收 TensorS / TensorD / TiledCopy, 去掉模板参数 <M,N,LD>
+//   2. 在 ex8() 里构造 layout / Tensor / TiledCopy, 传进去
+//   3. kernel 里只留 get_slice + partition + copy
+//
+// 这题想让你体会的是: layout 属于**数据的性质**, 应该由知道数据长什么样的那一方
+// (host) 来描述。写死在 kernel 里, 换个 stride 就得改 kernel。
+// ===========================================================================
+
+// TODO: 把这个 kernel 改成收 Tensor 和 TiledCopy。
+//       改完之后它应该和 ex7_kernel 长得几乎一样。
+template <int M, int N>
+__global__ void ex8_kernel(const float* src, float* dst, int* out_sizeof) {
+    // 这里的 stride 写死成 N —— 而真实数据的行 stride 是 20, 所以结果是错的
+    auto lay = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<N>{}, Int<1>{}));
+    auto S = make_tensor(make_gmem_ptr(src), lay);
+    auto D = make_tensor(make_gmem_ptr(dst), lay);
+
+    auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
+                              make_layout(make_shape(Int<8>{}, Int<4>{}),
+                                          make_stride(Int<4>{}, Int<1>{})),
+                              make_layout(make_shape(Int<1>{}, Int<4>{})));
+
+    auto thr = tc.get_slice(threadIdx.x);
+    copy(tc, thr.partition_S(S), thr.partition_D(D));
+
+    if (threadIdx.x == 0) out_sizeof[0] = int(sizeof(decltype(tc)));
+}
+
+void ex8() {
+    printf("\n--- 练习 8: layout 搬到 host ---\n");
+    constexpr int M = 8, N = 16, LD = 20;  // 行 stride = 20, 每行 16 个有效 + 4 个填充
+    constexpr int NBUF = M * LD;
+
+    float *d_s, *d_d;
+    int* d_sz;
+    CUDA_CHECK(cudaMalloc(&d_s, NBUF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_d, NBUF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_sz, sizeof(int)));
+
+    // 有效区填 1..128, 填充区填 -7 (搬错了就会把 -7 带过去)
+    float hs[NBUF], hd[NBUF];
+    for (int i = 0; i < NBUF; ++i) hs[i] = -7.f;
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c) hs[r * LD + c] = float(r * N + c + 1);
+    CUDA_CHECK(cudaMemcpy(d_s, hs, sizeof(hs), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_d, 0, NBUF * sizeof(float)));
+
+    // TODO: 改完 kernel 之后, 在这里构造 layout / Tensor / TiledCopy 再传进去。
+    //       正确的 layout 是 make_stride(Int<LD>{}, Int<1>{})。
+    ex8_kernel<M, N><<<1, 32>>>(d_s, d_d, d_sz);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(hd, d_d, sizeof(hd), cudaMemcpyDeviceToHost));
+    int sz = 0;
+    CUDA_CHECK(cudaMemcpy(&sz, d_sz, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // 只检查有效区: 每行前 16 个要搬对
+    bool ok = true;
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            if (hd[r * LD + c] != hs[r * LD + c]) ok = false;
+
+    printf("  有效区搬运 = %s, sizeof(TiledCopy) = %d\n", ok ? "正确" : "错误", sz);
+    if (!ok) printf("        (layout 的 stride 和真实数据不符 —— 见题目说明)\n");
+    expect("8x16 有效区全部搬对 (stride 20 的缓冲区)", ok);
+    expect("TiledCopy 是空类型 (sizeof == 1)", sz == 1);
+
+    CUDA_CHECK(cudaFree(d_s));
+    CUDA_CHECK(cudaFree(d_d));
+    CUDA_CHECK(cudaFree(d_sz));
+}
+
 int main() {
     printf("========== cute_03 练习 ==========\n");
     ex1();
@@ -285,6 +442,8 @@ int main() {
     ex4();
     ex5();
     ex6();
+    ex7();
+    ex8();
     printf("\n===== 结果: %d PASS, %d FAIL =====\n", g_pass, g_fail);
     if (g_fail > 0) printf("还有 TODO 没填 —— 打开 ex.cu 搜 TODO。\n");
     return g_fail == 0 ? 0 : 1;

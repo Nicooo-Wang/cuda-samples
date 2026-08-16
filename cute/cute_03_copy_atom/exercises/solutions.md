@@ -78,7 +78,7 @@ Tiler_MN = (16*2, 8*4) = (32,32)   ✓
 "TiledCopy uses too few vals for selected CopyAtom"
 ```
 
-> README §4 §4.2
+> README §5 §6.2
 
 ---
 
@@ -110,7 +110,7 @@ thr4 : 16 17 18 19       <- thr_layout 第 0 维走完 4 个后换行, 16 = 一�
 
 **要点**：`partition_S` 返回的是 rank-3 `((atom内), rest_m, rest_n)`。上面列的是第 0 个 mode（atom 内部那 4 个）。本题 `Tiler_MN = (8,16)`，Tensor 是 16×16，所以 `rest_m = 2, rest_n = 1` —— `copy()` 会自动跑 2 轮。
 
-> README §5 §5.2
+> README §6 §6.2
 
 ---
 
@@ -139,9 +139,9 @@ pred(i) = (&tS(i) - src) < n;
 
 只检查第一个方向的话，`pred(i) = true` 也能"通过" —— 但那就写越界了。
 
-**这就是 capstone §7.3 尾块处理的正确做法。** capstone 里为了简单用了"退回标量循环"，代价是最后一个 block 慢；`copy_if` 能保持向量化的同时挡住越界。
+**这就是 capstone §8.3 尾块处理的正确做法。** capstone 里为了简单用了"退回标量循环"，代价是最后一个 block 慢；`copy_if` 能保持向量化的同时挡住越界。
 
-> README §2.4 §7.3
+> README §2.4 §8.3
 
 ---
 
@@ -228,11 +228,93 @@ col-major (1,8):                    row-major (4,1):
 
 发现它只有两条路：**读 layout 推地址**，或者 **profiler**（`ncu --metrics l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld`，或看 `gld_efficiency`）。
 
-> README §6
+> README §7
 
 ---
 
-## 练习 7 — 改 capstone ★★★
+## 练习 7 — 向量化到底要求什么 ★★☆
+
+```cpp
+constexpr int EX7_MASK = 0b110;   // bit1 和 bit2 可以, bit0 不行
+```
+
+| layout | 能否用 128 bit atom |
+|---|---|
+| `make_stride(N, 1)` 全动态 | **不能**，编译失败 |
+| `make_stride(N, Int<1>{})` 末维 stride 静态 | 能 |
+| `make_stride(Int<16>{}, Int<1>{})` 全静态 | 能 |
+
+**要点：决定能否向量化的是 stride，不是 shape。**
+
+CuTe 要在编译期证明的命题是"这 4 个元素在内存里相邻"。这件事只由**被向量化那一维的 stride 等于 1** 决定 —— 一共有多少行多少列跟它无关。所以第 2 行的 shape 是运行时的 `(M,N)`，照样能发 `LDG.E.128`。
+
+第 1 行失败的报错：
+
+```
+"Copy_Traits: src failed to vectorize into registers.
+ Layout is incompatible with this CopyOp."
+```
+
+注意这里的 `1` 是个运行时 `int`，CuTe 无法在编译期知道它等于 1；写成 `Int<1>{}` 才是编译期的"1"。**这两个字面上都是 1，类型完全不同** —— 这是本题唯一的考点。
+
+> **为什么这题重要**：很容易从"全动态编译失败"推出"要向量化就得把尺寸做成模板参数"，然后给每个矩阵尺寸编译一份 kernel。CUTLASS 的做法恰恰相反 —— `M/N/K` 全是运行时 `int`，只有连续维的 stride 钉成 `Int<1>{}`：
+>
+> ```cpp
+> auto dA = make_stride(ldA, Int<1>{});    // sgemm_sm80.cu
+> ```
+>
+> 官方 `tiled_copy.cu` 也一样：`make_shape(256, 512)` 是运行时的，但默认 LayoutLeft 让第 0 维 stride 恰好是静态 `_1`，于是它的 `val_layout` 取 `(4,1)` 沿 M 方向。换成 `(1,4)` 沿 N 就会失败。
+
+> README §7.3
+
+---
+
+## 练习 8 — 把 layout 从 kernel 里搬到 host ★★☆
+
+kernel 改成收 Tensor 和 TiledCopy，一行 layout 都不留：
+
+```cpp
+template <class TensorS, class TensorD, class TiledCopy>
+__global__ void ex8_kernel(TensorS S, TensorD D, TiledCopy tc, int* out_sizeof) {
+    auto thr = tc.get_slice(threadIdx.x);
+    copy(tc, thr.partition_S(S), thr.partition_D(D));
+    if (threadIdx.x == 0) out_sizeof[0] = int(sizeof(TiledCopy));
+}
+```
+
+host 侧构造，注意 stride 用真实的 `LD = 20`：
+
+```cpp
+auto lay8 = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<LD>{}, Int<1>{}));
+auto tc8  = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
+                            make_layout(make_shape(Int<8>{}, Int<4>{}),
+                                        make_stride(Int<4>{}, Int<1>{})),
+                            make_layout(make_shape(Int<1>{}, Int<4>{})));
+ex8_kernel<<<1, 32>>>(make_tensor(make_gmem_ptr(d_s), lay8),
+                      make_tensor(make_gmem_ptr(d_d), lay8), tc8, d_sz);
+```
+
+**原来为什么错**：kernel 里写死了 `make_stride(Int<N>{}, Int<1>{})`，即行 stride 16。而真实缓冲区每行 20 个 float（16 有效 + 4 填充）。于是第 1 行往后每一行都读偏了 4 个位置，把填充值 `-7` 搬了过去。
+
+这是个真实场景 —— 带 leading dimension 的矩阵（cuBLAS 的 `ldA`）、行对齐到 128 字节的缓冲区、某个更大矩阵的子块，全都是 `stride != 宽度`。
+
+**要点：layout 是数据的性质，不是 kernel 的性质。**
+
+```
+谁知道 stride 是 20？    分配内存的那一方 —— host
+谁把它写死了？          kernel
+结果                     换个 stride 就得改 kernel（甚至改模板参数列表）
+```
+
+把描述权交给 host 之后，同一个 kernel 能吃任何 stride、任何形状、任何 TiledCopy 配置。capstone 的四个版本共用一套 kernel 模板，就是靠这一点。
+
+`sizeof(TiledCopy) == 1` 这一项在改之前也会 PASS —— 它验证的不是你改没改，而是让你确认**这样传参真的不花钱**：静态 layout 是空类型，形状信息全在类型里。
+
+> README §4 §4.2 §4.3
+
+---
+
+## 练习 9 — 改 capstone ★★★
 
 ### ① TILE 大小
 
@@ -300,4 +382,25 @@ TPB = 8  ->  4002 GB/s
 
 **这些技巧的正确用武之地是 GEMM** —— 那里一块数据被复用 O(tile) 次，搬运可以和计算重叠，`cp.async` + double buffer 才能真正发挥作用。Section 06 会看到同样的技术带来 2-3 倍的提升。
 
-> README §7.2 §7.3
+### ④ 把 layout 挪回 kernel 里要付什么代价
+
+现在四个版本共用 host 侧的 `mS` / `mD` / `tc_vec`，加一档 `uint64_t` 对比只需改 host **一处**：
+
+```cpp
+auto tc_64 = make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, float>{}, thr_lay,
+                             make_layout(Int<2>{}, Int<1>{}));
+// kernel 一个字不改, 直接换参数调用
+```
+
+如果 layout 和 TiledCopy 写死在 kernel 里（尺寸走模板参数），同一件事要改：
+
+1. kernel 里的 atom 类型
+2. kernel 里的 `val_layout`
+3. 因为 `VEC` 变了，`TILE/NTHR` 的关系也变 → 模板参数列表跟着变
+4. 每个组合都是一份独立的 kernel 实例
+
+**这就是 §4.3 那张表第 2 行的实际体感。** 把"数据长什么样"从 kernel 里拿出去之后，kernel 变成了一段**只管索引的纯逻辑**，参数空间的探索成本从"改代码"降到"改一行 host 声明"。
+
+Section 04 会重度依赖这一点 —— 那里要"只换一个 smem layout 就对比 plain / padded / swizzle 三种方案"，kernel 完全不动。
+
+> README §4.3 §8.2 §8.3

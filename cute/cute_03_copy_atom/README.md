@@ -29,7 +29,7 @@ Copy_Atom = 一条指令  +  这条指令要求的数据摆放方式
 
 然后用 `make_tiled_copy` 把这个 atom "铺"到整个 thread block 上，得到 **TiledCopy** —— 一张"谁搬哪一份"的分工表。之后 `copy(tc, src, dst)` 一行就够了，指令选择、向量宽度、线程分工全都由类型系统决定。
 
-本章讲清楚三件事：atom 内部是什么、怎么铺到线程上、以及**铺错了会怎样**（这部分最实用）。
+本章讲清楚四件事：atom 内部是什么、**这些东西该写在 host 还是 kernel 里**（§4，决定你的代码长什么样）、怎么铺到线程上、以及**铺错了会怎样**（§7，这部分最实用）。
 
 ---
 
@@ -210,7 +210,109 @@ recast<float4>(T);      // (4,2):(2,1)   8 列变 2 列，每列 4 个 float
 
 ---
 
-## 4. make_tiled_copy：把 atom 铺到整个 block
+## 4. 谁在 host 上做，谁在 kernel 里做
+
+这一节讲的是**写法惯例**，不是某个 API。它决定了你的 CuTe 代码长什么样，所以放在动手之前。
+
+先看 CUTLASS 官方 `examples/cute/tutorial/tiled_copy.cu` 的 kernel 签名：
+
+```cpp
+template <class TensorS, class TensorD, class Tiled_Copy>
+__global__ void copy_kernel_vectorized(TensorS S, TensorD D, Tiled_Copy tiled_copy)
+{
+  Tensor tile_S = S(make_coord(_, _), blockIdx.x, blockIdx.y);
+  ThrCopy thr_copy = tiled_copy.get_thread_slice(threadIdx.x);
+  Tensor thr_tile_S = thr_copy.partition_S(tile_S);
+  ...
+}
+```
+
+`Tensor` 和 `TiledCopy` 都是**参数**。它们在 `main()` 里构造好，整个 kernel 里没有一次 `make_layout`。`sgemm_sm80.cu` 更极端 —— 连 smem layout、TiledMMA、`cp.async` 的 atom 全是 host 构造后传进去的：
+
+```cpp
+// host 侧
+auto sA = tile_to_shape(swizzle_atom, make_shape(bM, bK, bP));
+TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{}, ...);
+TiledMMA  mmaC  = make_tiled_mma(SM80_16x8x16_F16F16F16F16_TN{}, ...);
+
+gemm_device<<<dimGrid, dimBlock, smem_size>>>(prob_shape, cta_tiler,
+                                              A, dA, sA, copyA, ...,
+                                              C, dC, sC, mmaC, ...);
+```
+
+### 4.1 这个分工是什么
+
+```
+┌─ host ────────────────────────────────────┐
+│  数据长什么样      make_layout / make_tensor
+│  用什么指令搬      Copy_Atom
+│  谁搬哪一份        make_tiled_copy / make_tiled_mma
+│  smem 怎么摆       tile_to_shape / Swizzle
+└───────────────────┬───────────────────────┘
+                    │  按值传参
+┌─ kernel ──────────▼───────────────────────┐
+│  我这个 block 负责哪块    local_tile(blockIdx)
+│  我这个线程负责哪几个    get_slice(threadIdx)
+│  搬                       copy() / gemm()
+└───────────────────────────────────────────┘
+```
+
+一句话：**host 描述，kernel 索引。** kernel 里出现的运行时量只有 `blockIdx` 和 `threadIdx`。
+
+### 4.2 为什么按值传 Tensor 和 TiledCopy 不心疼
+
+因为静态 layout 是**空类型** —— 形状信息全在类型里，运行时零字节：
+
+```
+Layout<Shape<_8,_16>,Stride<_16,_1>>         sizeof = 1    <- 空类型
+Copy_Atom<UniversalCopy<float>, float>       sizeof = 1    <- 空类型
+TiledCopy (128bit, 32 线程)                  sizeof = 1    <- 空类型
+Tensor<gmem_ptr<float>, 静态 layout>         sizeof = 8    <- 只有那个指针
+```
+
+传一个 `TiledCopy` 传的是零字节；传一个静态 `Tensor` 只传了里面的指针。对比一下运行时的：
+
+```
+Layout<Shape<int,int>,Stride<int,int>>       sizeof = 16
+Tensor<gmem_ptr<float>, 动态 layout>         sizeof = 24
+```
+
+`sizeof == 1` 是 C++ 对空类型的规定（对象必须有地址），实际做参数时被完全优化掉。
+
+### 4.3 为什么不在 kernel 里构造
+
+在 kernel 里写 `make_tiled_copy(...)` 能编译、也能跑对 —— 都是编译期的东西，编译器会消掉。但有三个实际问题：
+
+| | host 构造 | kernel 内构造 |
+|---|---|---|
+| 形状能不能 `print` 出来看 | 能，`print(tc)` 一行 | 要 `if (thread0()) print(...)` 再跑一遍 |
+| 换一组参数试 | 改 host 一行，kernel 不动 | 每种组合一份 kernel |
+| 静态检查 | `static_assert(size(copy) == size(mma))` 写在 kernel 开头，参数一进来就查 | 没有可查的对象 |
+
+第 2 点最实在。capstone 里四个版本共用同一个 kernel 模板，换的只是 host 传进去的 layout；如果 layout 写死在 kernel 里，就得复制四份 kernel。**这也是 Section 04 之后能"只改一个 smem layout 就对比三种方案"的前提。**
+
+> **反过来说，什么必须在 kernel 里？** 依赖 `blockIdx` / `threadIdx` 的一切：`local_tile`、`get_slice`、`partition_S/D`、`copy`。以及 `__shared__` 数组本身 —— 但它的 **layout** 仍然可以从 host 传进来（`sgemm_sm80.cu` 就是这么做的，capstone v3/v4 也一样）。
+
+### 4.4 一个例外：CuTe 不管你怎么分配内存
+
+`__shared__ float raw[...]` 的**大小**必须是编译期常量，所以它写在 kernel 里。惯例是按 layout 的 `cosize` 开：
+
+```cpp
+template <int TILE, class SLayout, ...>
+__global__ void k(..., SLayout slay, ...) {
+    __shared__ float raw[cosize_v<SLayout>];        // 大小由 layout 决定
+    auto sT = make_tensor(make_smem_ptr(raw), slay);  // layout 从 host 来
+    ...
+}
+```
+
+**用 `cosize` 而不是 `size`**：带 padding 的 layout（Section 04 会讲）最后一个元素的偏移超出 `size`，按 `size` 开会越界。这里 layout 无 padding，两者相等。
+
+> 对应源码：`cute_copy_v1.cu` §1（打印上面那张 sizeof 表）
+
+---
+
+## 5. make_tiled_copy：把 atom 铺到整个 block
 
 一个 atom 只描述"一次操作"。真实 kernel 里有几百个线程，需要一张分工表。
 
@@ -234,7 +336,7 @@ Tiler_MN = thr_shape * val_shape        (逐维相乘)
 
 即"这个 TiledCopy 一次覆盖多大一块"。
 
-### 4.1 标量版：32 线程 × 1 值
+### 5.1 标量版：32 线程 × 1 值
 
 ```cpp
 auto atom = Copy_Atom<UniversalCopy<float>, float>{};
@@ -260,7 +362,7 @@ i=7   | t28 | t29 | t30 | t31 |
       +-----+-----+-----+-----+
 ```
 
-### 4.2 向量版：32 线程 × 4 值
+### 5.2 向量版：32 线程 × 4 值
 
 只改两处 —— atom 换成 128 bit，`val_layout` 在**连续方向**给 4 个：
 
@@ -289,7 +391,7 @@ i=1   |   t4     |   t5     |   t6     |   t7     |
 
 ---
 
-## 5. partition_S / partition_D：把 Tensor 切给当前线程
+## 6. partition_S / partition_D：把 Tensor 切给当前线程
 
 ```cpp
 auto thr = tc.get_slice(threadIdx.x);   // 取出"我"这一份
@@ -298,7 +400,7 @@ auto tD  = thr.partition_D(D);          // 我要写的
 copy(tc, tS, tD);
 ```
 
-### 5.1 返回的是 rank-3，不是 rank-1
+### 6.1 返回的是 rank-3，不是 rank-1
 
 这一点第一次见会困惑。`partition_S` 的结果形如：
 
@@ -323,7 +425,7 @@ Tensor 8x16,  Tiler 8x4
 
 **`copy(tc, tS, tD)` 会自动遍历 `rest_*` 这些 mode。** 所以 `Tiler_MN` 比 Tensor 小完全没问题 —— 不需要你手写外层循环。这也是为什么上面标量版（tiler 只有 8×4）能把整个 8×16 搬完。
 
-### 5.2 观察实际地址：合并访存长什么样
+### 6.2 观察实际地址：合并访存长什么样
 
 标量版（`thr_layout` row-major，每线程 1 个值）每个线程拿到的偏移：
 
@@ -351,7 +453,7 @@ thr3 : 12  13  14  15
 
 ---
 
-## 6. thr_layout 写错会怎样（本章最实用的一节）
+## 7. thr_layout 写错会怎样（本章最实用的一节）
 
 把 `thr_layout` 从 row-major 改成 col-major，其他一个字不改：
 
@@ -397,7 +499,7 @@ thr3 : 48  52  56  60
 
 > 判断方法很简单：**让 `thr_layout` 的 stride-1 那一维，对上 Tensor 的连续那一维。** row-major Tensor（stride `(N,1)`）配 row-major thr_layout（stride `(k,1)`）。
 
-### 6.3 向量化需要编译期 stride
+### 7.3 向量化要求 stride 静态，不是 shape 静态
 
 另一个真实的坑。下面这段会**编译失败**：
 
@@ -414,29 +516,42 @@ error: static assertion failed with
  Layout is incompatible with this CopyOp."
 ```
 
-原因：CuTe 必须在**编译期**证明这 4 个元素连续，才敢发 128 bit 指令。运行时的 `N` 做不到这个证明。
+很容易由此得出结论"要向量化就得把整个 layout 写成编译期的"。**这个结论是错的**，而且错得有代价 —— 它会让你把本该动态的矩阵尺寸也塞进模板参数，每个尺寸编译一份 kernel。
 
-修法是把尺寸变成编译期常量（模板参数）：
+真正的要求只有一条：**被向量化那一维的 stride 是静态的。** shape 可以是运行时值。同一个 128 bit TiledCopy 沿列方向搬，三种写法的结果：
 
-```cpp
-template <int M, int N, class TiledCopy>
-__global__ void kernel(const float* src, float* dst, TiledCopy tc) {
-    auto lay = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<N>{}, Int<1>{}));
-    ...
-}
-```
+| gmem layout | 结果 |
+|---|---|
+| `make_stride(N, 1)` 全动态 | **编译失败** |
+| `make_stride(N, Int<1>{})` 只有末维 stride 静态 | 通过 |
+| `make_stride(Int<N>{}, Int<1>{})` 全静态 | 通过 |
 
-**这就是 Section 01 说"能编译期确定就用 `Int<N>`"的实际后果** —— 不是风格建议，是能不能向量化的硬性前提。
+中间那行是关键：`shape` 是运行时的 `(M, N)`，照样能发 `LDG.E.128`。
 
-> 对应源码：`cute_copy_v1.cu` §3 §4
+道理也说得通 —— CuTe 要证明的是"这 4 个元素在内存里相邻"，这件事只由**那一维的 stride 等于 1** 决定，跟一共有多少行多少列无关。
+
+> **官方 example 正是这么写的。** `tiled_copy.cu` 用 `make_shape(256, 512)`（运行时 `int`）却能做 128 bit 搬运，因为 `make_layout` 默认是 **LayoutLeft（列主序）**，第 0 维 stride 恰好是静态的 `_1`：
+>
+> ```
+> make_layout(make_shape(M, N))  ==  (256,512):(_1,256)
+>                                            ~~~~ 静态
+> ```
+>
+> 它的 `val_layout` 是 `(4,1)` —— 沿 **M** 方向，也就是 stride 为 `_1` 的那一维。换成 `(1,4)` 沿 N 就会编译失败。
+
+**实践建议：尺寸该动态就动态，但连续那一维的 stride 一定写成 `Int<1>{}`。** CUTLASS 的 GEMM 就是这个风格 —— `M/N/K` 全是运行时 `int`，而 `dA = make_stride(ldA, Int<1>{})` 把连续维钉成静态。
+
+这仍然印证 Section 01 说的"能编译期确定就用 `Int<N>`"，只是要精确到位：**关键的那个编译期常量是 stride，不是 shape。**
+
+> 对应源码：`cute_copy_v1.cu` §4 §5
 
 ---
 
-## 7. Capstone：用 Copy_Atom 写高带宽 memcpy
+## 8. Capstone：用 Copy_Atom 写高带宽 memcpy
 
 `cute_copy_capstone.cu` 做四个版本，和 `cudaMemcpy` 对照。数据量 256 MB（读+写 537 MB）。
 
-### 7.1 四个版本
+### 8.1 四个版本
 
 **v1 naive** —— 每线程一个 float，grid-stride：
 
@@ -444,17 +559,33 @@ __global__ void kernel(const float* src, float* dst, TiledCopy tc) {
 for (int i = idx; i < n; i += stride) dst[i] = src[i];
 ```
 
-**v2 vectorized** —— TiledCopy + 128 bit atom，每线程 4 个 float：
+**v2 vectorized** —— TiledCopy + 128 bit atom，每线程 4 个 float。按 §4 的分工，host 构造、kernel 只索引：
 
 ```cpp
-auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>,
+// host
+auto mS = make_tensor(make_gmem_ptr(d_src),
+                      make_layout(make_shape(N), make_stride(Int<1>{})));   // N 是运行时的
+auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
                           make_layout(Int<NTHR>{}, Int<1>{}),
-                          make_layout(Int<VEC>{},  Int<1>{}));
-auto thr = tc.get_slice(threadIdx.x);
-copy(tc, thr.partition_S(S), thr.partition_D(D));
+                          make_layout(Int<TILE/NTHR>{}, Int<1>{}));
+
+// kernel
+auto gS = local_tile(mS, Shape<Int<TILE>>{}, make_coord(blockIdx.x));   // 我这个 block 的那块
+auto thr = tc.get_slice(threadIdx.x);                                   // 我这个线程的那份
+copy(tc, thr.partition_S(gS), thr.partition_D(gD));
 ```
 
-**v3 smem 中转** —— gmem → smem 用 `cp.async`，再 smem → gmem：
+注意 `mS` 的 shape 是运行时的 `N`，只有 stride 是 `Int<1>{}` —— 按 §7.3，这就够向量化了。
+
+**v3 smem 中转** —— gmem → smem 用 `cp.async`，再 smem → gmem。smem 的 **layout 也从 host 传进来**，kernel 里只按 `cosize` 开数组：
+
+```cpp
+// host
+auto slay = make_layout(Int<TILE>{}, Int<1>{});
+
+// kernel
+__shared__ float raw[cosize_v<SLayout>];
+auto sT = make_tensor(make_smem_ptr(raw), slay);
 
 ```cpp
 auto atom_async = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, float>{};
@@ -479,15 +610,25 @@ loop t:
 
 `cp_async_wait<N>` 的 `N` 是"允许还有几批在飞"。发了下一块就是 `wait<1>`，最后一轮没有后续就是 `wait<0>`。
 
-### 7.2 实际结果（H 系列，sm_90）
+v4 的 smem layout 多了一维，用来选缓冲区：
+
+```cpp
+auto slay_2buf = make_layout(make_shape(Int<TILE>{}, Int<2>{}));   // (TILE, PIPE)
+...
+copy(tc_load, ..., thr_load.partition_D(sT(_, buf)));              // sT(_, buf) 取第 buf 块
+```
+
+**这个 PIPE 维就是多 stage 流水线的最小形态。** Section 06 的 GEMM 里它会变成 `(BM, BK, PIPE)`，`PIPE` 取 3~5，而取哪一块的写法完全一样 —— `sA(_,_,pipe_index)`。v4 只是 `PIPE = 2` 的特例。
+
+### 8.2 实际结果（H 系列，sm_90）
 
 ```
 version                time(ms)         GB/s      ok
-cudaMemcpy D2D            0.129         4177     yes
-naive (scalar)            0.149         3594     yes
-TiledCopy 128bit          0.128         4181     yes
-smem staging              0.130         4143     yes
-double buffer             0.132         4067     yes
+cudaMemcpy D2D            0.128         4183     yes
+naive (scalar)            0.149         3601     yes
+TiledCopy 128bit          0.128         4186     yes
+smem staging              0.129         4156     yes
+double buffer             0.132         4064     yes
 
 相对 cudaMemcpy:
   naive (scalar)       0.86x
@@ -508,31 +649,31 @@ double buffer             0.132         4067     yes
 
 > **工具是有适用范围的。** 看到一个技术在某处有效，不等于它到处有效 —— 要问"它掩盖的是什么开销，我这里有这个开销吗"。
 
-### 7.3 尾块处理
+### 8.3 尾块处理
 
-`N` 不一定被 `TILE` 整除。capstone 里用的是最简单的办法 —— 尾块退回标量：
+capstone 取的 `N` 恰好被 `TILE` 整除（`static_assert` 卡住了这一点），所以四个版本都不用管边界 —— 这是为了让代码只讲一件事。
 
-```cpp
-int base = blockIdx.x * TILE;
-if (base + TILE > n) {
-    for (int i = base + threadIdx.x; i < n; i += NTHR) dst[i] = src[i];
-    return;
-}
-```
+真实场景里 `N` 不会这么配合，有三种处理方式：
 
-代价是最后一个 block 慢一点，但只影响 1/grid 的工作量。更优雅的做法是 `copy_if` + 谓词（§2.4），练习 4 会让你写一遍。
+| 办法 | 代价 | 用在哪 |
+|---|---|---|
+| 尾块退回标量循环 | 最后一个 block 慢，只影响 1/grid | 最省事 |
+| `copy_if` + 谓词（§2.4） | 多算一个谓词 tensor | CUTLASS 的标准做法 |
+| 分配时向上取整到 `TILE` 的倍数 | 多占一点显存 | 你能控制分配时 |
+
+第二种最通用，练习 4 会让你写一遍。官方 `tiled_copy_if.cu` 用的也是它，配合 `make_identity_tensor` 拿到全局坐标来判断越界。
 
 ---
 
-## 8. 代码怎么读
+## 9. 代码怎么读
 
 三个程序是上面内容的可执行版本。**建议先读完本 README，再打开代码。**
 
 | 文件 | 对应章节 | 内容 |
 |---|---|---|
 | `cute_copy_v0.cu` | §1 §2 §3 | `copy(S,D)`、Copy_Atom 三件套、`copy_if`、`max_common_vector`、`recast` |
-| `cute_copy_v1.cu` | §4 §5 §6 | `make_tiled_copy`、`partition_S/D` 的 rank-3 形状、thr_layout 写错的后果 |
-| `cute_copy_capstone.cu` | §7 | 四版 memcpy + `cudaMemcpy` 对照 |
+| `cute_copy_v1.cu` | §4 §5 §6 §7 | host/kernel 分工、`make_tiled_copy`、`partition_S/D` 的 rank-3 形状、thr_layout 写错的后果 |
+| `cute_copy_capstone.cu` | §8 | 四版 memcpy + `cudaMemcpy` 对照 |
 
 代码小节与本文的对应：
 
@@ -544,10 +685,13 @@ if (base + TILE > n) {
 | v0 §4 `copy_if` | §2.4 |
 | v0 §5 `max_common_vector` | §3 |
 | v0 §6 `recast` | §3.2 |
-| v1 §1 标量 TiledCopy | §4.1 §5 |
-| v1 §2 向量 TiledCopy | §4.2 §5.2 |
-| v1 §3 thr_layout 写错 | §6 |
-| v1 §4 编译期 stride | §6.3 |
+| v1 §1 host 描述 / kernel 索引、sizeof 表 | §4 |
+| v1 §2 标量 TiledCopy | §5.1 §6 |
+| v1 §3 向量 TiledCopy | §5.2 §6.2 |
+| v1 §4 thr_layout 写错 | §7 |
+| v1 §5 向量化要求 stride 静态 | §7.3 |
+
+> **v0 是个例外：它在 host 上跑 CuTe。** 那是为了单独讲 atom 的属性和 `copy_if` 的语义，不涉及线程分工 —— 用 host 代码最省事。从 v1 起全部是 kernel，遵循 §4 的分工。
 
 ```bash
 make run              # 全部跑一遍
@@ -605,15 +749,46 @@ make ex               # 做练习
 
 改成 row-major，让 thr0..thr3 的首地址变成 `0,1,2,3`。
 
-**这题的意义**：这是你在真实代码里最可能犯、且最难发现的错误。做完之后，回头看 §6 那张表。
+**这题的意义**：这是你在真实代码里最可能犯、且最难发现的错误。做完之后，回头看 §7 那张表。
 
-### 练习 7 — 改 capstone ★★★
+### 练习 7 — 向量化到底要求什么 ★★☆
+`ex7_kernel` 收一个 host 传进来的 Tensor，用 128 bit atom 沿连续方向搬。
+
+三个候选 layout 里选出**能编译且能向量化**的那些，填进 `EX7_MASK`（bit0/1/2）：
+
+```cpp
+0: make_layout(make_shape(M, N),             make_stride(N, 1))
+1: make_layout(make_shape(M, N),             make_stride(N, Int<1>{}))
+2: make_layout(make_shape(Int<8>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{}))
+```
+
+**先想清楚再填**：CuTe 需要在编译期证明的是"这 4 个元素相邻"，这件事由 shape 决定还是由 stride 决定？
+
+填完之后把你选中的每个 layout 真的传进 kernel 跑一遍 —— 检查会告诉你哪个编译不过。
+
+### 练习 8 — 把 layout 从 kernel 里搬到 host ★★☆
+`ex8_kernel` 是按"kernel 内构造"的老写法写的：`make_layout` / `make_tiled_copy` 全在 kernel 里，尺寸靠模板参数 `<M, N>` 传。
+
+把它改成 §4 的分工：
+
+1. kernel 签名改成收 `TensorS S, TensorD D, TiledCopy tc`，去掉模板参数 `<M, N>`；
+2. 在 `ex8()` 里构造 layout / Tensor / TiledCopy，传进去；
+3. kernel 里只留 `get_slice` + `partition` + `copy`。
+
+改完后检查会验证两件事：结果仍然正确，且 `sizeof(TiledCopy) == 1`（说明你传的确实是空类型）。
+
+**这题的意义**：这是本章最该形成的肌肉记忆。做完之后你写任何 CuTe kernel 都会先问"这个东西该在 host 还是 kernel"。
+
+### 练习 9 — 改 capstone ★★★
 1. 把 `TILE` 从 `NTHR*4` 改成 `NTHR*2`、`NTHR*8`、`NTHR*16`，各跑一次记录带宽。
    `NTHR*2` 会发生什么？（先想，再编译 —— 错误信息本身就是答案。）
    剩下几个哪个最好？为什么不是越大越好？
 2. 把 v2 的 atom 从 `uint128_t` 依次换成 `uint64_t`（每线程 2 个）和 `float`（每线程 1 个），
    记录三个带宽。相邻两档的提升幅度一样吗？说明瓶颈在哪一档发生了转移。
-3. v4 的 `TILES_PER_BLOCK` 改成 2 和 8，观察变化。结合 §7.2 第 3 点解释你看到的现象。
+3. v4 的 `TILES_PER_BLOCK` 改成 2 和 8，观察变化。结合 §8.2 第 3 点解释你看到的现象。
+4. 现在四个版本共用 host 侧的 `mS`/`mD`/`tc_vec`。试着把 v2 的 layout 改回写在 kernel 里
+   （尺寸走模板参数），然后再想加一档 `uint64_t` 的对比 —— 需要改几处？
+   这就是 §4.3 那张表第 2 行的实际体感。
 
 > 跑之前记得 `CUDA_VISIBLE_DEVICES=<idle>`，否则邻居负载会把结论淹掉。
 
@@ -629,11 +804,14 @@ make ex               # 做练习
 | `AutoVectorizingCopy` | 宽度交给 CuTe 现场推 | 常规情形的默认选择 |
 | `max_common_vector` | src/dst 共同的最大连续长度 | 能否向量化的判据 |
 | `copy_if` | 带谓词的搬运 | 尾块 / 边界处理 |
+| **host 描述，kernel 索引** | layout/atom/TiledCopy 在 host 构造，kernel 只用 blockIdx/threadIdx | CuTe 代码的基本骨架 |
+| 静态 layout 是空类型 | `sizeof == 1`，按值传参零成本 | 上一条之所以可行 |
 | `make_tiled_copy` | atom + thr_layout + val_layout | 一张"谁搬哪一份"的分工表 |
 | `Tiler_MN` | `thr_shape * val_shape` | 一次覆盖多大一块 |
 | `partition_S/D` | 返回 `((atom内),rest_m,rest_n)` | `copy()` 自动遍历 rest |
 | **thr_layout 写错** | **结果正确但不合并，无任何报错** | 最常见的性能 bug |
-| 编译期 stride | 向量化的硬性前提 | `Int<N>` 不是风格问题 |
+| 向量化的前提 | **连续那一维的 stride 静态**（shape 可以动态） | 尺寸不必塞进模板参数 |
 | `cp.async` | 搬运不占寄存器和指令流 | GEMM 流水线的基础 |
+| smem 的 PIPE 维 | `(TILE, PIPE)`，`sT(_, i)` 取第 i 块 | 多 stage 流水线的写法 |
 
 **下一章：Section 04 — TiledCopy。** 本章的 `make_tiled_copy` 只是入门用法。Section 04 会讲多级分块（block tile → warp tile → thread tile）、`ldmatrix` 这类给 Tensor Core 喂数据的特殊 atom，以及 swizzle 如何在 layout 层面消掉 bank conflict。
