@@ -45,7 +45,7 @@ void expect_layout(const char* what, L1 const& got, L2 const& want) {
 // 不看代码先答：Copy_Atom<UniversalCopy<uint64_t>, half_t> 的 NumValSrc 是多少？
 // 把你的答案写进 EX1_NUMVAL。
 // ===========================================================================
-constexpr int EX1_NUMVAL = 0;  // TODO: 改成你的答案
+constexpr int EX1_NUMVAL = 4;  // TODO: 改成你的答案
 
 void ex1() {
     printf("\n--- 练习 1: Copy_Atom 三件套 ---\n");
@@ -76,12 +76,12 @@ void ex2() {
     // TODO: 填 thr_layout。128 个线程，要让相邻线程访问相邻地址。
     //       提示: 32x32 一块、每线程 4 个 -> 列方向需要 32/4 = 8 个线程
     //       下面是能编译的占位值（1x1 个线程），改成正确的形状。
-    auto thr_layout = make_layout(make_shape(Int<1>{}, Int<1>{}), make_stride(Int<1>{}, Int<1>{}));
+    auto thr_layout = make_layout(make_shape(Int<16>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{}));
 
     // TODO: 填 val_layout。每线程 8 个 float = (行方向 ?, 列方向 4)。
     //       注意: 列方向必须 >= 4，否则编译失败
     //       "TiledCopy uses too few vals for selected CopyAtom"。
-    auto val_layout = make_layout(make_shape(Int<1>{}, Int<4>{}));
+    auto val_layout = make_layout(make_shape(Int<2>{}, Int<4>{}));
 
     auto tc = make_tiled_copy(atom, thr_layout, val_layout);
 
@@ -101,7 +101,7 @@ void ex2() {
 // 先在纸上答：thr0 拿到的 4 个元素，偏移分别是多少？
 // 把答案填进 EX3_OFFSETS，然后运行验证。
 // ===========================================================================
-constexpr int EX3_OFFSETS[4] = {0, 0, 0, 0};  // TODO
+constexpr int EX3_OFFSETS[4] = {0, 1, 2, 3};  // TODO
 
 __global__ void ex3_kernel(const float* base, int* out) {
     auto lay = make_layout(make_shape(Int<16>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{}));
@@ -166,7 +166,14 @@ __global__ void ex4_kernel(const float* src, float* dst, int n) {
     // TODO: 填谓词。第 i 个元素的全局下标是 base + (&tS(i) - (src + base))
     //       只有全局下标 < n 才允许搬。
     for (int i = 0; i < int(size(tS)); ++i) {
-        pred(i) = false;  // TODO: 改成正确的条件
+        if (base + (&tS(i) - (src + base)) >= n)
+        {
+            pred(i) = false; // TODO: 改成正确的条件
+        }
+        else
+        {
+            pred(i) = true; // TODO: 改成正确的条件
+        }
     }
 
     copy_if(pred, tS, tD);
@@ -211,9 +218,9 @@ void ex4() {
 // 判断下面三对 src/dst 能不能用 128bit (=4 个 float) 搬。
 // 先答再运行。
 // ===========================================================================
-constexpr int EX5_A = 0;  // TODO: max_common_vector(连续32, 连续32)
-constexpr int EX5_B = 0;  // TODO: max_common_vector(连续32, stride-4 的 32)
-constexpr int EX5_C = 0;  // TODO: max_common_vector((4,8):(8,1), (4,8):(1,4))
+constexpr int EX5_A = 32;  // TODO: max_common_vector(连续32, 连续32)
+constexpr int EX5_B = 1;  // TODO: max_common_vector(连续32, stride-4 的 32)
+constexpr int EX5_C = 1;  // TODO: max_common_vector((4,8):(8,1), (4,8):(1,4))
 
 void ex5() {
     printf("\n--- 练习 5: max_common_vector ---\n");
@@ -222,8 +229,8 @@ void ex5() {
     auto c1 = make_tensor(make_gmem_ptr(p), make_layout(Int<32>{}, Int<1>{}));
     auto c2 = make_tensor(make_gmem_ptr(p + 128), make_layout(Int<32>{}, Int<1>{}));
     auto s4 = make_tensor(make_gmem_ptr(p + 128), make_layout(Int<32>{}, Int<4>{}));
-    auto rm = make_tensor(make_gmem_ptr(p),
-                          make_layout(make_shape(Int<4>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{})));
+    auto rm =
+        make_tensor(make_gmem_ptr(p), make_layout(make_shape(Int<4>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{})));
     auto cm = make_tensor(make_gmem_ptr(p + 128),
                           make_layout(make_shape(Int<4>{}, Int<8>{}), make_stride(Int<1>{}, Int<4>{})));
 
@@ -249,10 +256,10 @@ __global__ void ex6_kernel(const float* base, int* out) {
 
     // TODO: 这个 thr_layout 是 col-major，导致相邻线程差了一整行。
     //       改成 row-major。
-    auto thr_layout = make_layout(make_shape(Int<8>{}, Int<4>{}), make_stride(Int<1>{}, Int<8>{}));
+    auto thr_layout = make_layout(make_shape(Int<8>{}, Int<4>{}), make_stride(Int<8>{}, Int<1>{}));
 
     auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<float>, float>{}, thr_layout,
-                              make_layout(make_shape(Int<1>{}, Int<1>{})));
+                              make_layout(make_shape(Int<4>{}, Int<1>{})));
 
     auto p = tc.get_slice(threadIdx.x).partition_S(A);
     if (threadIdx.x < 4) out[threadIdx.x] = int(&p(0) - base);
@@ -288,7 +295,7 @@ void ex6() {
 //
 // 先想: CuTe 要在编译期证明"这 4 个元素相邻"。这件事由 shape 决定还是 stride 决定？
 // ===========================================================================
-constexpr int EX7_MASK = 0;  // TODO
+constexpr int EX7_MASK = 0b110;  // TODO
 
 // 只有能向量化的 layout 才能实例化这个 kernel。
 // 全动态那个如果传进来会编译失败 —— 所以下面只实例化你认为可以的。
@@ -372,22 +379,13 @@ void ex7() {
 
 // TODO: 把这个 kernel 改成收 Tensor 和 TiledCopy。
 //       改完之后它应该和 ex7_kernel 长得几乎一样。
-template <int M, int N>
-__global__ void ex8_kernel(const float* src, float* dst, int* out_sizeof) {
-    // 这里的 stride 写死成 N —— 而真实数据的行 stride 是 20, 所以结果是错的
-    auto lay = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<N>{}, Int<1>{}));
-    auto S = make_tensor(make_gmem_ptr(src), lay);
-    auto D = make_tensor(make_gmem_ptr(dst), lay);
-
-    auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
-                              make_layout(make_shape(Int<8>{}, Int<4>{}),
-                                          make_stride(Int<4>{}, Int<1>{})),
-                              make_layout(make_shape(Int<1>{}, Int<4>{})));
-
+template <class TensorS, class TensorD, class TiledCopy>
+__global__ void ex8_kernel(TensorS S, TensorD D, TiledCopy tc, int* d_sz) {
+    if(threadIdx.x == 0){
+        *d_sz = sizeof(tc);
+    }
     auto thr = tc.get_slice(threadIdx.x);
     copy(tc, thr.partition_S(S), thr.partition_D(D));
-
-    if (threadIdx.x == 0) out_sizeof[0] = int(sizeof(decltype(tc)));
 }
 
 void ex8() {
@@ -411,7 +409,14 @@ void ex8() {
 
     // TODO: 改完 kernel 之后, 在这里构造 layout / Tensor / TiledCopy 再传进去。
     //       正确的 layout 是 make_stride(Int<LD>{}, Int<1>{})。
-    ex8_kernel<M, N><<<1, 32>>>(d_s, d_d, d_sz);
+    auto layS = make_layout(make_shape(Int<M>{}, Int<N>{}), make_stride(Int<LD>{}, Int<1>{}));
+    auto layD = layS;
+    auto tS = make_tensor(make_gmem_ptr(d_s), layS);
+    auto tD = make_tensor(make_gmem_ptr(d_d), layD);
+    auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, float>{},
+                              make_layout(make_shape(Int<M>{}, Int<N / 4>{}), make_stride(Int<N / 4>{}, Int<1>{})),
+                              make_layout(make_shape(Int<1>{}, Int<4>{})));
+    ex8_kernel<<<1, 32>>>(tS, tD, tc, d_sz);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaMemcpy(hd, d_d, sizeof(hd), cudaMemcpyDeviceToHost));
