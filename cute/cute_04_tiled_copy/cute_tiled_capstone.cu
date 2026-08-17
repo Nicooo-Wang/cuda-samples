@@ -5,9 +5,16 @@
 // 转置是"smem layout 决定性能"最干净的例子:
 //   写 smem 按行 (合并), 读 smem 按列 (冲突) —— 冲突全部集中在一处, 好观察。
 //
-// 阅读方式: 每一版都是「kernel + 紧跟其后的 launch 代码」一个整体, 从上往下顺读,
-// 不需要在 main 和 kernel 之间来回跳。main 只负责建缓冲区、按顺序叫这四版。
-// 三个 smem layout 也各自写在自己那一版里, 而不是攒在 main 顶部。
+// ---------------------------------------------------------------------------
+// 阅读方式
+//
+// 每个版本都是「一个 kernel + 紧跟其后的一个 host 函数」, host 函数里自带这一版
+// 需要的全部东西: 缓冲区、smem layout、launch、验证、计时。
+// 从上往下顺读即可, 不需要跳到 main 里去找参数是怎么来的。
+//
+// v2/v3/v4 共用同一个 kernel, 唯一的差别是各自 host 函数里声明的那一个 layout ——
+// 这就是 cute_03 §4「host 描述, kernel 索引」的直接回报。
+// ---------------------------------------------------------------------------
 //
 // 多卡机器上请指定一张空闲卡:  CUDA_VISIBLE_DEVICES=<idle> ./cute_tiled_capstone
 
@@ -19,24 +26,53 @@
 using namespace cute;
 
 // ---------------------------------------------------------------------------
-// 全局配置 + 四版共用的测量脚手架
-//
-// 先把"每版都要做的事"抽干净, 下面每一版就只剩它自己独有的那几行。
+// 全局配置
 // ---------------------------------------------------------------------------
-constexpr int TILE = 32;
-constexpr int NTHR = 256;
+constexpr int TILE = 32;    // smem 里中转的方块边长 (32x32 float)
+constexpr int NTHR = 256;   // 每 block 线程数
 constexpr int M = 8192, N = 8192;
 
-// 四版共享的缓冲区。main 里建一次, 按引用传给每个 run_*。
-struct Bufs {
-    const float* h_in;
-    float* h_out;
+// ---------------------------------------------------------------------------
+// 四个版本共用的缓冲区 —— 构造时分配并填好, 析构时释放
+//
+// 每个 run_* 开头写一行 `Buffers buf;` 就得到一套干净的 in/out。
+// ---------------------------------------------------------------------------
+struct Buffers {
+    static constexpr size_t bytes = size_t(M) * N * sizeof(float);
+
     float* d_in;
     float* d_out;
-    size_t bytes;
+    float* h_in;
+    float* h_out;
+
+    Buffers() {
+        CUDA_CHECK(cudaMalloc(&d_in, bytes));
+        CUDA_CHECK(cudaMalloc(&d_out, bytes));
+        h_in = (float*)malloc(bytes);
+        h_out = (float*)malloc(bytes);
+        for (size_t i = 0; i < size_t(M) * N; ++i) h_in[i] = float(i % 1024);
+        CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_out, 0, bytes));
+    }
+
+    ~Buffers() {
+        CUDA_CHECK(cudaFree(d_in));
+        CUDA_CHECK(cudaFree(d_out));
+        free(h_in);
+        free(h_out);
+    }
+
+    // 抽稀采样比对: 8192x8192 全量比对太慢, 按互质步长扫一遍足够抓出 layout 错误
+    bool check() {
+        CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < M; i += 97)
+            for (int j = 0; j < N; j += 89)
+                if (h_out[size_t(j) * M + i] != h_in[size_t(i) * N + j]) return false;
+        return true;
+    }
 };
 
-struct Row {
+struct Result {
     const char* name;
     float ms;
     bool ok;
@@ -44,24 +80,11 @@ struct Row {
 
 static dim3 grid() { return dim3(N / TILE, M / TILE); }
 
-// 抽稀采样比对: 8192x8192 全量比对太慢, 按互质步长扫一遍足够抓出 layout 错误
-static bool verify(const Bufs& b) {
-    for (int i = 0; i < M; i += 97)
-        for (int j = 0; j < N; j += 89)
-            if (b.h_out[size_t(j) * M + i] != b.h_in[size_t(i) * N + j]) return false;
-    return true;
-}
-
-// 每版都是这三步: 清 dst -> 计时 -> 拷回来验证。抽出来免得四份重复。
-template <class Launch>
-static Row measure(const char* name, Bufs& b, Launch&& launch) {
-    CUDA_CHECK(cudaMemset(b.d_out, 0, b.bytes));
-    float ms = time_kernel(launch);
-    CUDA_CHECK(cudaMemcpy(b.h_out, b.d_out, b.bytes, cudaMemcpyDeviceToHost));
-    Row r{name, ms, verify(b)};
-    printf("    %.3f ms   %.1f GB/s   %s\n", r.ms,
-           transpose_bandwidth_gbs(size_t(M) * N, sizeof(float), r.ms), r.ok ? "正确" : "错误");
-    return r;
+// 每版结尾都是这一句: 算带宽、打印、打包成 Result
+static Result report(const char* name, float ms, bool ok) {
+    printf("    %.3f ms   %.1f GB/s   %s\n", ms,
+           transpose_bandwidth_gbs(size_t(M) * N, sizeof(float), ms), ok ? "正确" : "错误");
+    return {name, ms, ok};
 }
 
 // 打印一个 smem layout 的关键属性: 摆法、占多少、列读撞得多狠
@@ -70,17 +93,16 @@ static void describe(SLay slay) {
     printf("    layout = ");
     print(slay);
     printf("   cosize = %d", int(cosize(slay)));
-    int worst = max_bank_requests(32, [&](int l) { return int(slay(l, 0)) * 4; });
-    printf("   列读 = %d-way\n", worst);
+    printf("   列读 = %d-way\n", max_bank_requests(32, [&](int l) { return int(slay(l, 0)) * 4; }));
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // v1  完全不过 smem: 直接跨步写
 //
-// gmem 读是合并的 (一个 warp 读同一行的连续 32 个), 但写是跨步的 —— 相邻 lane
+// gmem 读是合并的 (一个 warp 读同一行连续 32 个), 但写是跨步的 —— 相邻 lane
 // 写到相隔 M 个 float 的位置, 32 次写命中 32 个不同的 128B sector。
-// 这是 baseline: 不用 smem, 就只能在读和写里牺牲一边。
-// ---------------------------------------------------------------------------
+// 不用 smem, 就只能在读和写里牺牲一边。
+// ===========================================================================
 __global__ void transpose_naive(const float* __restrict__ in, float* __restrict__ out) {
     int by = blockIdx.y * TILE;
     int col = blockIdx.x * TILE + threadIdx.x % TILE;
@@ -89,22 +111,22 @@ __global__ void transpose_naive(const float* __restrict__ in, float* __restrict_
         if (r < M && col < N) out[size_t(col) * M + r] = in[size_t(r) * N + col];
 }
 
-static Row run_naive(Bufs& b) {
+static Result run_naive() {
     printf("\nv1  naive —— 不过 smem, 写 gmem 跨步\n");
-    return measure("naive (no smem)", b,
-                   [&] { transpose_naive<<<grid(), NTHR>>>(b.d_in, b.d_out); });
+
+    Buffers buf;
+    float ms = time_kernel([&] { transpose_naive<<<grid(), NTHR>>>(buf.d_in, buf.d_out); });
+    return report("naive (no smem)", ms, buf.check());
 }
 
-// ---------------------------------------------------------------------------
-// v2/v3/v4  过 smem —— 三版共用下面这一个 kernel, 唯一的差别是传进来的 slay
+// ===========================================================================
+// v2/v3/v4 共用的 kernel —— 过 smem, 唯一的变量是传进来的 slay
 //
 // 读写两边都合并了: gmem 按行读 -> smem, smem 按列读 -> gmem 按行写。
-// 代价是所有冲突都被挤到"按列读 smem"这一步, 于是 layout 成了唯一的变量。
+// 代价是所有冲突都被挤到「按列读 smem」这一步, 于是 layout 成了唯一的变量。
 //
-// 这正是 cute_03 §4 那套分工的回报: 「smem 怎么摆」是 host 传进来的参数,
-// kernel 只管索引。下面三个 run_* 各自声明自己的 layout, kernel 一个字不改。
 // smem 数组按 cosize_v 开 —— padding 版的 cosize 比 size 大, 用 size 会溢出。
-// ---------------------------------------------------------------------------
+// ===========================================================================
 template <class SLay>
 __global__ void transpose_smem(const float* __restrict__ in, float* __restrict__ out, SLay slay) {
     __shared__ __align__(128) float raw[cosize_v<SLay>];
@@ -126,79 +148,79 @@ __global__ void transpose_smem(const float* __restrict__ in, float* __restrict__
         if (bx + r < N && by + tx < M) out[size_t(bx + r) * M + by + tx] = s(tx, r);
 }
 
-// --- v2: plain。行 stride = 32 = bank 数, 列方向整列撞同一个 bank ---
-static Row run_smem_plain(Bufs& b) {
-    auto plain =
-        make_layout(make_shape(Int<TILE>{}, Int<TILE>{}), make_stride(Int<TILE>{}, Int<1>{}));
-
+// ---------------------------------------------------------------------------
+// v2  plain —— 行 stride = 32 = bank 数, 整列撞同一个 bank
+// ---------------------------------------------------------------------------
+static Result run_smem_plain() {
     printf("\nv2  plain —— 过 smem, 但没管 bank\n");
-    describe(plain);
-    return measure("smem plain (32-way conf)", b,
-                   [&] { transpose_smem<<<grid(), NTHR>>>(b.d_in, b.d_out, plain); });
+
+    auto slay = make_layout(make_shape(Int<TILE>{}, Int<TILE>{}),
+                            make_stride(Int<TILE>{}, Int<1>{}));
+    describe(slay);
+
+    Buffers buf;
+    float ms = time_kernel([&] { transpose_smem<<<grid(), NTHR>>>(buf.d_in, buf.d_out, slay); });
+    return report("smem plain (32-way conf)", ms, buf.check());
 }
 
-// --- v3: padding。行 stride 改成 33, 每行错开一个 bank ---
-static Row run_smem_padded(Bufs& b) {
-    auto pad =
-        make_layout(make_shape(Int<TILE>{}, Int<TILE>{}), make_stride(Int<TILE + 1>{}, Int<1>{}));
-
+// ---------------------------------------------------------------------------
+// v3  padded —— 行 stride 改成 33, 每行错开一个 bank
+// ---------------------------------------------------------------------------
+static Result run_smem_padded() {
     printf("\nv3  padded —— stride 33, 用多占 smem 换掉冲突\n");
-    describe(pad);
+
+    auto slay = make_layout(make_shape(Int<TILE>{}, Int<TILE>{}),
+                            make_stride(Int<TILE + 1>{}, Int<1>{}));
+    describe(slay);
     printf("    代价: 比 plain 多占 %d 个 float, 且行首不再 128B 对齐\n",
-           int(cosize(pad)) - TILE * TILE);
-    return measure("smem padded (stride 33)", b,
-                   [&] { transpose_smem<<<grid(), NTHR>>>(b.d_in, b.d_out, pad); });
+           int(cosize(slay)) - TILE * TILE);
+
+    Buffers buf;
+    float ms = time_kernel([&] { transpose_smem<<<grid(), NTHR>>>(buf.d_in, buf.d_out, slay); });
+    return report("smem padded (stride 33)", ms, buf.check());
 }
 
-// --- v4: swizzle。不改 shape 也不多占一个字节, 只改坐标->偏移的映射 ---
-static Row run_smem_swizzle(Bufs& b) {
-    auto plain =
-        make_layout(make_shape(Int<TILE>{}, Int<TILE>{}), make_stride(Int<TILE>{}, Int<1>{}));
-    auto swz = composition(Swizzle<5, 0, 5>{}, plain);
-
+// ---------------------------------------------------------------------------
+// v4  swizzle —— 不改 shape 也不多占一个字节, 只改坐标->偏移的映射
+// ---------------------------------------------------------------------------
+static Result run_smem_swizzle() {
     printf("\nv4  swizzle —— 同样消掉冲突, 但一个字节都不多占\n");
-    describe(swz);
+
+    auto plain = make_layout(make_shape(Int<TILE>{}, Int<TILE>{}),
+                             make_stride(Int<TILE>{}, Int<1>{}));
+    auto slay = composition(Swizzle<5, 0, 5>{}, plain);
+    describe(slay);
     printf("    这是 Hopper 唯一能走的路: TMA / WGMMA 不接受 padding 过的 layout\n");
-    return measure("smem Swizzle<5,0,5>", b,
-                   [&] { transpose_smem<<<grid(), NTHR>>>(b.d_in, b.d_out, swz); });
+
+    Buffers buf;
+    float ms = time_kernel([&] { transpose_smem<<<grid(), NTHR>>>(buf.d_in, buf.d_out, slay); });
+    return report("smem Swizzle<5,0,5>", ms, buf.check());
 }
 
-// ---------------------------------------------------------------------------
-// main —— 只做三件事: 建缓冲区, 按顺序叫四版, 汇总
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// main —— 按顺序跑四版, 汇总
+// ===========================================================================
 int main() {
     printf("cute_04 capstone —— %dx%d float 转置\n", M, N);
     printf("TILE = %d, 每 block %d 线程, grid = (%d,%d)\n", TILE, NTHR, N / TILE, M / TILE);
 
-    Bufs b{};
-    b.bytes = size_t(M) * N * sizeof(float);
-
-    float* h_in = (float*)malloc(b.bytes);
-    for (size_t i = 0; i < size_t(M) * N; ++i) h_in[i] = float(i % 1024);
-    b.h_in = h_in;
-    b.h_out = (float*)malloc(b.bytes);
-
-    CUDA_CHECK(cudaMalloc(&b.d_in, b.bytes));
-    CUDA_CHECK(cudaMalloc(&b.d_out, b.bytes));
-    CUDA_CHECK(cudaMemcpy(b.d_in, h_in, b.bytes, cudaMemcpyHostToDevice));
-
-    Row rows[4] = {run_naive(b), run_smem_plain(b), run_smem_padded(b), run_smem_swizzle(b)};
+    Result results[] = {
+        run_naive(), run_smem_plain(), run_smem_padded(), run_smem_swizzle(),
+    };
 
     print_separator("汇总");
     printf("  %-26s %10s %12s %6s\n", "version", "time(ms)", "GB/s", "ok");
-    for (auto& r : rows)
+    for (auto& r : results)
         printf("  %-26s %10.3f %12.1f %6s\n", r.name, r.ms,
                transpose_bandwidth_gbs(size_t(M) * N, sizeof(float), r.ms), r.ok ? "yes" : "NO");
 
     printf("\n  相对 plain smem 的加速:\n");
-    for (int i = 2; i < 4; ++i) printf("    %-26s %.2fx\n", rows[i].name, rows[1].ms / rows[i].ms);
+    for (int i = 2; i < 4; ++i) printf("    %-26s %.2fx\n", results[i].name,
+                                       results[1].ms / results[i].ms);
 
-    printf("\n  读一遍 + 写一遍 = %.1f GB, 本机 HBM 理论带宽约 4.9 TB/s\n", 2.0 * b.bytes / 1e9);
+    printf("\n  读一遍 + 写一遍 = %.1f GB, 本机 HBM 理论带宽约 4.9 TB/s\n",
+           2.0 * Buffers::bytes / 1e9);
 
-    CUDA_CHECK(cudaFree(b.d_in));
-    CUDA_CHECK(cudaFree(b.d_out));
-    free(h_in);
-    free(b.h_out);
     printf("\ncapstone OK\n");
     return 0;
 }
