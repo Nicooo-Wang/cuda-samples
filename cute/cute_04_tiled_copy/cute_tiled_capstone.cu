@@ -190,15 +190,37 @@ static Result run_smem_swizzle() {
                              make_stride(Int<TILE>{}, Int<1>{}));
     auto slay = composition(Swizzle<5, 0, 5>{}, plain);
     describe(slay);
-    printf("    这是 Hopper 唯一能走的路: TMA / WGMMA 不接受 padding 过的 layout\n");
+    printf("    SM90 上只能走这条路: WGMMA 编译期拒绝 padding 过的 layout (见 v2 §5.3)\n");
+    printf("    注意 M=0 -> 行内一个连续对都不剩, 宽向量 atom 用不了 (见 v0 §3.4)\n");
 
     Buffers buf;
     float ms = time_kernel([&] { transpose_smem<<<grid(), NTHR>>>(buf.d_in, buf.d_out, slay); });
     return report("smem Swizzle<5,0,5>", ms, buf.check());
 }
 
+// ---------------------------------------------------------------------------
+// v5  swizzle M=2 —— 同样消冲突, 但保住 4 个 float 连续
+//
+// v4 的 Swizzle<5,0,5> 把冲突消到 1-way, 代价是 M=0 打乱了行内连续性。
+// Swizzle<3,2,3> 换个平衡点: 4-way 冲突, 但 4 个 float 仍连续 -> 宽向量能用。
+// 这是 v0 §3.4 那张表在真实 kernel 上的验证。
+// ---------------------------------------------------------------------------
+static Result run_smem_swizzle_m2() {
+    printf("\nv5  Swizzle<3,2,3> —— M=2, 用 4-way 冲突换回行内连续性\n");
+
+    auto plain = make_layout(make_shape(Int<TILE>{}, Int<TILE>{}),
+                             make_stride(Int<TILE>{}, Int<1>{}));
+    auto slay = composition(Swizzle<3, 2, 3>{}, plain);
+    describe(slay);
+    printf("    GMMA 官方原子走的就是这条路线 (它们 M 全 = 4), 见 v2 §5.4\n");
+
+    Buffers buf;
+    float ms = time_kernel([&] { transpose_smem<<<grid(), NTHR>>>(buf.d_in, buf.d_out, slay); });
+    return report("smem Swizzle<3,2,3>", ms, buf.check());
+}
+
 // ===========================================================================
-// main —— 按顺序跑四版, 汇总
+// main —— 按顺序跑五版, 汇总
 // ===========================================================================
 int main() {
     printf("cute_04 capstone —— %dx%d float 转置\n", M, N);
@@ -206,7 +228,9 @@ int main() {
 
     Result results[] = {
         run_naive(), run_smem_plain(), run_smem_padded(), run_smem_swizzle(),
+        run_smem_swizzle_m2(),
     };
+    constexpr int NRES = sizeof(results) / sizeof(results[0]);
 
     print_separator("汇总");
     printf("  %-26s %10s %12s %6s\n", "version", "time(ms)", "GB/s", "ok");
@@ -215,8 +239,13 @@ int main() {
                transpose_bandwidth_gbs(size_t(M) * N, sizeof(float), r.ms), r.ok ? "yes" : "NO");
 
     printf("\n  相对 plain smem 的加速:\n");
-    for (int i = 2; i < 4; ++i) printf("    %-26s %.2fx\n", results[i].name,
-                                       results[1].ms / results[i].ms);
+    for (int i = 2; i < NRES; ++i) printf("    %-26s %.2fx\n", results[i].name,
+                                          results[1].ms / results[i].ms);
+
+    printf("\n  三种消冲突方案在 SM90 上的可用性:\n");
+    printf("    padding stride 33   最快, 但 WGMMA 编译期拒绝  -> SM90 上不能用\n");
+    printf("    Swizzle<5,0,5>      冲突最少, 但 M=0 挡住宽向量 atom\n");
+    printf("    Swizzle<3,2,3>      M=2 保住 4-float 连续 -> 和 GMMA 官方原子同路线\n");
 
     printf("\n  读一遍 + 写一遍 = %.1f GB, 本机 HBM 理论带宽约 4.9 TB/s\n",
            2.0 * Buffers::bytes / 1e9);
