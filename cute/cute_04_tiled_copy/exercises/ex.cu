@@ -10,10 +10,17 @@
 //   4 -> §5.4  选 GMMA 原子
 //   5 -> §5.2 §5.3  TMA 和 WGMMA 谁挑 layout
 //   6 -> §3 §4  修一个真实的 layout bug
+//   7 -> §5.2  手写一段 TMA 搬运
+//   8 -> §6.2  把单缓冲改成 TMA Double Buffer
 
 #include <cute/tensor.hpp>
 #include <cute/atom/copy_atom.hpp>
 #include <cute/atom/mma_atom.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/pipeline/sm90_pipeline.hpp>
+#include <cutlass/device_kernel.h>
 #include <cstdio>
 #include <cuda_runtime.h>
 
@@ -314,6 +321,295 @@ void ex6() {
     CUDA_CHECK(cudaFree(d_probe));
 }
 
+
+// ===========================================================================
+// 练习 7 — 手写一段 TMA 搬运 ★★★   (README §5.2)
+//
+// gmem 里的 A 是 GM x GK 的 half, row-major stride=(GK,1)。
+// 用 TMA 把 tile (0,0) = TM x TK 搬进 smem, 再倒出来给 host 比对。
+//
+// 【交给学员】这个 kernel 已经把五个硬性条件都写了 (v2 §5.2)，但把它们
+// 打乱放在注释里。你的任务: 先盖住下面的实现, 独立重写一遍, 再对照 ——
+// 能默写出来 = 真正懂了 TMA。
+//
+//   TODO-A  src 必须是 tma.get_tma_tensor(shape)
+//   TODO-B  partition 用 tma_partition, 不是 partition_S/D
+//   TODO-C  事务字节数 = sizeof(make_tensor_like(tensor<0>(tAs)))
+//   TODO-D  elect 出的那 1 个 lane 才发指令
+//   TODO-E  copy(tma.with(bar), tAg, tAs(_, _0)) 一条指令搬整块
+constexpr int EX7_TM = 128, EX7_TK = 64, EX7_GM = 256, EX7_GK = 128;
+
+template <class Tma, class SLay>
+__global__ void ex7_tma_kernel(CUTLASS_GRID_CONSTANT Tma const tma, SLay slay, half_t* out) {
+    __shared__ __align__(128) half_t raw[cosize_v<SLay>];
+    __shared__ __align__(8) uint64_t bar[1];
+
+    auto sA = make_tensor(make_smem_ptr(raw), slay);  // (TM,TK,PIPE)
+
+    // 下面 5 个 TODO 都被"注释掉"了 —— 现在 ex7 编译不过。
+    // 每个 TODO 的注释里写了"这一步该干什么 + 答案长什么样"。
+    // 你照着 v2 §5.2 的 copy_tma_kernel 把这 5 段解的解开、写的写对, ex7 就能跑通。
+    // (答案就藏在注释里, 先盖住自己默写一遍, 实在卡住再解开对照)
+
+    // TODO-A  条件 1: src 必须是坐标 tensor (即 tma.get_tma_tensor(shape))。
+    //        解开下面这行, shape 传 gmem 的整体尺寸 (EX7_GM, EX7_GK):
+    //   auto mA = tma.get_tma_tensor(make_shape(EX7_GM, EX7_GK));
+    // TODO-B  条件 5: partition 用 tma_partition + group_modes<0,2>:
+    //   auto pa = tma_partition(tma, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA),
+    //                           group_modes<0, 2>(gA));
+    //   auto gA = local_tile(???);    <- 还需要一行的写完 gA = 本 CTA 的 (0,0) 块
+    //      再取 tAg = get<0>(pa);  tAs = get<1>(pa);
+    // TODO-C  条件: mbarrier 按字节等。tx_bytes = sizeof(make_tensor_like(tensor<0>(tAs)));
+    // TODO-D  elect_one_sync() 每 warp 选一个 lane; 再限定 warp==0 -> 全 block 只剩 1 个
+    // TODO-E  if (warp==0 && one) { Bar::arrive_and_expect_tx(&bar[0], tx_bytes);
+    //                              copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{})); }
+    //  然后所有线程 Bar::wait(&bar[0], 0);
+    //
+    // 现在主动代码里什么 TMA 都没发。下面有 4 处引用了"还没写"的名字,
+    // 所以 ex7 现在编译不过。把每个 [TODO-X] 替换成真实代码即可。
+
+    int warp = cutlass::canonical_warp_idx_sync();
+    // [TODO-D]  这里本该是:
+    //   int one = cute::elect_one_sync();
+    int one = EX7_PENDING_ONE;                                  // <- 换掉
+    // [TODO-A/B/C]  这里本该是: mA / gA / pa / tAg / tAs / tx_bytes
+    //   但现在它们是"未定义" -> 下方引用它们就是编译错误
+    // [TODO-E]  这里本该是:
+    //   using Bar = cutlass::arch::ClusterTransactionBarrier;
+    //   if (warp == 0 && one) { Bar::init(&bar[0], 1); }
+    //   cutlass::arch::fence_barrier_init();
+    //   __syncthreads();
+    //   if (warp == 0 && one) {
+    //       Bar::arrive_and_expect_tx(&bar[0], tx_bytes);
+    //       copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{}));
+    //   }
+    EX7_PENDING_BARRIER_BLOCK;                                  // <- 换成上面那整段
+    Bar::wait(&bar[0], 0);
+    __syncthreads();
+
+    auto s2 = sA(_, _, Int<0>{});
+    for (int i = threadIdx.x; i < EX7_TM * EX7_TK; i += blockDim.x) out[i] = s2(i / EX7_TK, i % EX7_TK);
+}
+
+void ex7() {
+    printf("\n--- 练习 7: 手写 TMA 搬运 (§5.2) ---\n");
+    printf("  现在 ex7 编译不过 (TODO 全空着)。\n");
+    printf("  五个 TODO 的答案都写在注释里, 也在 v2 §5.2 的 copy_tma_kernel 里。\n");
+    printf("  填完 -> 编译 -> 跑通 -> 输出 PASS。\n");
+
+    size_t bytes = size_t(EX7_GM) * EX7_GK * sizeof(half_t);
+    size_t tbytes = size_t(EX7_TM) * EX7_TK * sizeof(half_t);
+    half_t *d_a, *d_out, *h_a, *h_out;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, tbytes));
+    h_a = new half_t[EX7_GM * EX7_GK];
+    h_out = new half_t[EX7_TM * EX7_TK];
+    for (int i = 0; i < EX7_GM * EX7_GK; ++i) h_a[i] = half_t(float(i % 1024));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_out, 0, tbytes));
+
+    auto gm = make_tensor(make_gmem_ptr(d_a),
+                          make_layout(make_shape(EX7_GM, EX7_GK), make_stride(EX7_GK, Int<1>{})));
+    auto slay = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
+                              make_shape(Int<EX7_TM>{}, Int<EX7_TK>{}, Int<1>{}));
+    auto tma = make_tma_atom(SM90_TMA_LOAD{}, gm, slay(_, _, Int<0>{}),
+                             make_shape(Int<EX7_TM>{}, Int<EX7_TK>{}));
+
+    dim3 block(128), cluster(1, 1, 1), grid(1, 1);
+    cutlass::ClusterLaunchParams params{grid, block, cluster, 0};
+    void const* kptr = reinterpret_cast<void const*>(&ex7_tma_kernel<decltype(tma), decltype(slay)>);
+    cutlass::launch_kernel_on_cluster(params, kptr, tma, slay, d_out);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, tbytes, cudaMemcpyDeviceToHost));
+    int bad = 0;
+    for (int r = 0; r < EX7_TM; ++r)
+        for (int c = 0; c < EX7_TK; ++c)
+            if (h_out[r * EX7_TK + c] != h_a[r * EX7_GK + c]) ++bad;
+    printf("  TMA 落数错误 %d 处\n", bad);
+    expect("TMA 搬运结果正确", bad == 0);
+    printf("  (独立默写通过后, 把参考实现和 solutions.md 对照)\n");
+
+    cudaFree(d_a);
+    cudaFree(d_out);
+    delete[] h_a;
+    delete[] h_out;
+}
+
+// ===========================================================================
+// 练习 8 — TMA Double Buffer ★★★   (README §6.2)
+//
+// 单缓冲的 TMA->WGMMA: gmem A/B = BM/GK, BN/GK; C = A*B^T。
+// 改成 2-stage double buffer, 让"搬 k+1"和"算 k"重叠。
+//
+// 【交给学员】参考实现已写好。三个 TODO 是理解关键:
+//   TODO-A  smem 数组带 PIPE 维 (Int<EX8_STAGES>), 两个 buffer 轮换
+//   TODO-B  prologue 把两个 stage 都填满
+//   TODO-C  wst/rst 两个 PipelineState 都从 0 开始, 不要预推进
+// 盖住重写一遍, 注意 PipelineState 预推进会死锁 (v3 §6.2 的坑)。
+// ===========================================================================
+constexpr int EX8_BM = 64, EX8_BN = 64, EX8_BK = 64, EX8_GK = 256;
+constexpr int EX8_STAGES = 2;  // double buffer
+
+template <class TmaA, class TmaB, class SLayA, class SLayB, class MMA>
+__global__ void ex8_db_kernel(CUTLASS_GRID_CONSTANT TmaA const tma_a,
+                              CUTLASS_GRID_CONSTANT TmaB const tma_b, SLayA sla, SLayB slb,
+                              MMA mma, float* C) {
+    __shared__ __align__(128) half_t rawA[cosize_v<SLayA>];  // TODO-A (BM,BK,STAGES)
+    __shared__ __align__(128) half_t rawB[cosize_v<SLayB>];
+    __shared__ __align__(8) uint64_t full[EX8_STAGES], empty[EX8_STAGES];
+
+    Tensor sA = make_tensor(make_smem_ptr(rawA), sla);
+    Tensor sB = make_tensor(make_smem_ptr(rawB), slb);
+
+    Tensor mA = tma_a.get_tma_tensor(make_shape(EX8_BM, EX8_GK));
+    Tensor mB = tma_b.get_tma_tensor(make_shape(EX8_BN, EX8_GK));
+    Tensor gA = local_tile(mA, make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}), make_coord(0, _));
+    Tensor gB = local_tile(mB, make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}), make_coord(0, _));
+
+    auto pa = tma_partition(tma_a, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA), group_modes<0, 2>(gA));
+    auto pb = tma_partition(tma_b, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sB), group_modes<0, 2>(gB));
+    Tensor tAg = get<0>(pa);
+    Tensor tAs = get<1>(pa);
+    Tensor tBg = get<0>(pb);
+    Tensor tBs = get<1>(pb);
+    constexpr int txb = sizeof(make_tensor_like(tensor<0>(tAs))) + sizeof(make_tensor_like(tensor<0>(tBs)));
+
+    using FullBar = cutlass::arch::ClusterTransactionBarrier;
+    using EmptyBar = cutlass::arch::ClusterBarrier;
+
+    int warp = cutlass::canonical_warp_idx_sync();
+    int one = cute::elect_one_sync();
+    CUTE_UNROLL
+    for (int s = 0; s < EX8_STAGES; ++s) {
+        if (warp == 0 && one) {
+            FullBar::init(&full[s], 1);
+            EmptyBar::init(&empty[s], 128);
+        }
+    }
+    cutlass::arch::fence_barrier_init();
+    __syncthreads();
+
+    int ktiles = size<1>(tAg);
+    int ktile = 0, left = ktiles;
+
+    // TODO-B  prologue: 把 EX8_STAGES 个 stage 都填满。
+    //   每个 stage s: 如果还有 tile 要搬 (left>0), 让 warp==0&&one 的 lane 做:
+    //     FullBar::arrive_and_expect_tx(&full[s], txb);
+    //     copy(tma_a.with(full[s]), tAg(_, ktile), tAs(_, s));
+    //     copy(tma_b.with(full[s]), tBg(_, ktile), tBs(_, s));
+    //   然后 --left; ++ktile;
+    // 解开下面注释并填完:
+    // CUTE_UNROLL
+    // for (int s = 0; s < EX8_STAGES; ++s) {
+    //     if (left > 0) {
+    //         if (warp == 0 && one) {
+    //             EX8_PENDING_PROLOGUE_BODY;  // <- 替换成真实的 arrive+copy 两行
+    //         }
+    //         --left;
+    //         ++ktile;
+    //     }
+    // }
+    EX8_PENDING_PROLOGUE;  // <- 编译错误: 用上面的模板填完 prologue 之后把这行删掉
+
+    ThrMMA thr = mma.get_thread_slice(threadIdx.x);
+    Tensor gC = make_tensor(make_gmem_ptr(C),
+                            make_layout(make_shape(Int<EX8_BM>{}, Int<EX8_BN>{}),
+                                        make_stride(Int<EX8_BN>{}, Int<1>{})));
+    Tensor tCgC = thr.partition_C(gC);
+    Tensor tCrC = thr.make_fragment_C(tCgC);
+    clear(tCrC);
+    Tensor tCrA = thr.make_fragment_A(thr.partition_A(sA));
+    Tensor tCrB = thr.make_fragment_B(thr.partition_B(sB));
+
+    // TODO-C  两个 PipelineState 都从 0 开始 (不要预推进, 否则死锁!)
+    //   auto wst = cutlass::PipelineState<EX8_STAGES>();
+    //   auto rst = cutlass::PipelineState<EX8_STAGES>();
+    auto EX8_PENDING_STATES = cutlass::PipelineState<EX8_STAGES>(); // <- 把这行改成上面两行
+
+    CUTE_NO_UNROLL
+    while (left > -EX8_STAGES) {
+        int rp = rst.index();
+        FullBar::wait(&full[rp], rst.phase());
+
+        warpgroup_arrive();
+        gemm(mma, tCrA(_, _, _, rp), tCrB(_, _, _, rp), tCrC);
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+
+        EmptyBar::arrive(&empty[rp]);
+        ++rst;
+
+        if (warp == 0 && one && left > 0) {
+            int wp = wst.index();
+            EmptyBar::wait(&empty[wp], wst.phase());
+            FullBar::arrive_and_expect_tx(&full[wp], txb);
+            copy(tma_a.with(full[wp]), tAg(_, ktile), tAs(_, wp));
+            copy(tma_b.with(full[wp]), tBg(_, ktile), tBs(_, wp));
+            ++wst;
+        }
+        --left;
+        ++ktile;
+    }
+    copy(tCrC, tCgC);
+}
+
+void ex8() {
+    printf("\n--- 练习 8: TMA Double Buffer (§6.2) ---\n");
+    printf("  参考实现已写好 —— 盖住重写一遍, 注意 PipelineState 预推进会死锁。\n");
+
+    auto sla = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
+                             make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}, Int<EX8_STAGES>{}));
+    auto slb = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
+                             make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}, Int<EX8_STAGES>{}));
+    half_t *d_a, *d_b;
+    float* d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, size_t(EX8_BM) * EX8_GK * sizeof(half_t)));
+    CUDA_CHECK(cudaMalloc(&d_b, size_t(EX8_BN) * EX8_GK * sizeof(half_t)));
+    CUDA_CHECK(cudaMalloc(&d_c, size_t(EX8_BM) * EX8_BN * sizeof(float)));
+    half_t* h_a = new half_t[EX8_BM * EX8_GK];
+    half_t* h_b = new half_t[EX8_BN * EX8_GK];
+    for (int i = 0; i < EX8_BM * EX8_GK; ++i) h_a[i] = half_t(float(int(i % 7) - 3));
+    for (int i = 0; i < EX8_BN * EX8_GK; ++i) h_b[i] = half_t(float(int(i % 5) - 2));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, size_t(EX8_BM) * EX8_GK * sizeof(half_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, size_t(EX8_BN) * EX8_GK * sizeof(half_t), cudaMemcpyHostToDevice));
+
+    auto gm_a = make_tensor(make_gmem_ptr(d_a),
+                            make_layout(make_shape(Int<EX8_BM>{}, EX8_GK), make_stride(EX8_GK, Int<1>{})));
+    auto gm_b = make_tensor(make_gmem_ptr(d_b),
+                            make_layout(make_shape(Int<EX8_BN>{}, EX8_GK), make_stride(EX8_GK, Int<1>{})));
+    auto ta = make_tma_atom(SM90_TMA_LOAD{}, gm_a, sla(_, _, Int<0>{}), make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}));
+    auto tb = make_tma_atom(SM90_TMA_LOAD{}, gm_b, slb(_, _, Int<0>{}), make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}));
+    auto mma = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
+
+    for (int i = 0; i < 5; ++i) {  // 跑 5 次, 抓 barrier 死锁/竞争
+        cutlass::ClusterLaunchParams params{dim3(1, 1, 1), dim3(128), dim3(1, 1, 1), 0};
+        void const* kptr = reinterpret_cast<void const*>(
+            &ex8_db_kernel<decltype(ta), decltype(tb), decltype(sla), decltype(slb), decltype(mma)>);
+        cutlass::launch_kernel_on_cluster(params, kptr, ta, tb, sla, slb, mma, d_c);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    float* h_c = new float[EX8_BM * EX8_BN];
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, size_t(EX8_BM) * EX8_BN * sizeof(float), cudaMemcpyDeviceToHost));
+    int bad = 0;
+    for (int m = 0; m < EX8_BM; ++m)
+        for (int n = 0; n < EX8_BN; ++n) {
+            double acc = 0;
+            for (int k = 0; k < EX8_GK; ++k) acc += float(h_a[m * EX8_GK + k]) * float(h_b[n * EX8_GK + k]);
+            if (fabs(acc - h_c[m * EX8_BN + n]) > 1e-2) ++bad;
+        }
+    printf("  C = A*B^T 错误 %d 处\n", bad);
+    expect("TMA Double Buffer 结果正确", bad == 0);
+    printf("  (独立默写通过后和 solutions.md 对照)\n");
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+    delete[] h_a;
+    delete[] h_b;
+    delete[] h_c;
+}
 int main() {
     printf("========== cute_04 练习 ==========\n");
     ex1();
@@ -322,6 +618,8 @@ int main() {
     ex4();
     ex5();
     ex6();
+    ex7();
+    ex8();
     printf("\n===== 结果: %d PASS, %d FAIL =====\n", g_pass, g_fail);
     if (g_fail > 0) printf("还有 TODO 没填 —— 打开 ex.cu 搜 TODO。\n");
     return g_fail == 0 ? 0 : 1;

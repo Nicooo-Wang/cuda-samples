@@ -228,3 +228,67 @@ smem，`Sw<5,0,5>` 直接编译不过。
    而要看**能不能用**——这就是第 3 点。
 3. **padding 最快但在 SM90 上不能用。** 这是本章最重要的工程结论：
    性能排序和可用性排序不是一回事。
+
+---
+
+## 练习 7 — 手写 TMA 搬运 ★★★
+
+参考实现（对应 v2 §5.2 的 `copy_tma_kernel`）。五个 TODO 的答案：
+
+```cpp
+// TODO-A  src 必须是坐标 tensor, 不是普通 gmem tensor
+auto mA = tma.get_tma_tensor(make_shape(EX7_GM, EX7_GK));
+
+// TODO-B  partition 用 tma_partition (group_modes 把 mode-0 交给 TMA)
+auto pa = tma_partition(tma, Int<0>{}, Layout<_1>{},
+                        group_modes<0, 2>(sA), group_modes<0, 2>(gA));
+auto tAg = get<0>(pa);   // (TMA,)      gmem 侧
+auto tAs = get<1>(pa);   // (TMA,PIPE)  smem 侧
+
+// TODO-C  事务字节数 —— mbarrier 要按字节等
+constexpr int tx_bytes = sizeof(make_tensor_like(tensor<0>(tAs)));
+
+// TODO-D  每 warp 选一个 lane, 再限定 warp==0 -> 全 block 只有 1 个 lane 发指令
+int warp = cutlass::canonical_warp_idx_sync();
+int one  = cute::elect_one_sync();
+...
+if (warp == 0 && one) {
+    Bar::arrive_and_expect_tx(&bar[0], tx_bytes);
+    // TODO-E  一条指令搬整块
+    copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{}));
+}
+Bar::wait(&bar[0], 0);
+```
+
+四个隐含的前提（host 侧已经替你做好，独立写时要自己记得）：
+
+1. **`__align__(128)`** —— smem 数组。
+2. **descriptor 用真实设备指针构造**（`make_tma_atom` 的 src 是 `d_a`，不是 `nullptr`）。
+3. **smem layout 必须带 PIPE 维**，建 atom 时传 `slay(_,_,Int<0>{})` 切片。
+4. **cluster launch**：`launch_kernel_on_cluster`，单 CTA 也走这一步。
+
+> README §5.2
+
+---
+
+## 练习 8 — TMA Double Buffer ★★★
+
+参考实现就是 v3 §6.2 的 `gemm_pipe_kernel<2>`。三个 TODO 的定位：
+
+- **TODO-A**：smem 的 PIPE 维从 `1` 改成 `STAGES`（`tile_to_shape` 的 third 维）。
+- **TODO-B**：prologue 用一个 `for (s = 0..STAGES-1)` 把每个 stage 都 `arrive_and_expect_tx` + 两条 `copy` 填满。
+- **TODO-C**：`full`（装满，按字节等）和 `empty`（用完，按到达数等）两组 barrier；
+  `PipelineState<STAGES>` 的 wst/rst **都从 0 开始**。
+
+**最容易错的一行**（v3 §6.2 的坑）：
+
+```cpp
+auto wst = cutlass::PipelineState<STAGES>();   // ← 不要 ++STAGES 次!
+auto rst = cutlass::PipelineState<STAGES>();
+```
+
+prologue 填满 STAGES 个 buffer 后，"write_state 也该预推进"这个直觉是错的——
+预推进会让第一次 `EmptyBar::wait` 用错 phase，死锁。官方写法靠"只在即将
+复用某 stage 时才 wait empty"来保证不阻塞。这也是练习里跑 5 次要抓的东西。
+
+> README §6.2

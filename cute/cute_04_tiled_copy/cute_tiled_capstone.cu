@@ -1,6 +1,6 @@
 // cute_04 capstone —— 矩阵转置: naive / padding / swizzle 三版对比
 //
-// 对应 README §8。
+// 对应 README §7 + §8。
 //
 // 转置是"smem layout 决定性能"最干净的例子:
 //   写 smem 按行 (合并), 读 smem 按列 (冲突) —— 冲突全部集中在一处, 好观察。
@@ -19,6 +19,11 @@
 // 多卡机器上请指定一张空闲卡:  CUDA_VISIBLE_DEVICES=<idle> ./cute_tiled_capstone
 
 #include <cute/tensor.hpp>
+#include <cute/atom/copy_atom.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/device_kernel.h>
 #include <cstdio>
 
 #include "common.h"
@@ -220,7 +225,121 @@ static Result run_smem_swizzle_m2() {
 }
 
 // ===========================================================================
-// main —— 按顺序跑五版, 汇总
+// v6  TMA 版转置 —— 把搬运交给硬件
+//
+// v1-v5 的 gmem->smem 都是"每线程算地址"。这一步换成 TMA:
+//   一个 lane 描述整块, 硬件搬, mbarrier 按字节等 (五个硬性条件见 v2 §5.2)。
+//
+// 注意这里用的是 half, 不是 float, 矩阵也小 (2048^2)。原因是对 TMA 而言
+// 128 字节一行的 swizzle 模式天生是给 16-bit 元素设计的 (v2 §5.3);
+// 而且 TMA 的价值在本章已经由 v3 的流水线证明了 —— 它擅长"整块搬进 smem
+// 喂给 WGMMA", 不是"在纯转置这种转换操作上抢带宽"。
+// 所以 v6 不放进 v1-v5 的 float 对比表, 它只是证明 TMA 这一步能换, 且换对。
+// ===========================================================================
+constexpr int HALF_M = 2048, HALF_N = 2048;  // 256 MB half
+constexpr int HTILE = 128;                    // 一个 CTA 搬 128x128 half = 32KB
+constexpr int HNTHR = 128;
+
+template <class Tma, class SLay, class TS, class TC>
+__global__ void transpose_tma(CUTLASS_GRID_CONSTANT Tma const tma, SLay slay3, TS stlay, TC tc,
+                              half_t* out) {
+    __shared__ __align__(128) half_t rawS[cosize_v<SLay>];  // 条件 3
+    __shared__ __align__(8) uint64_t bar[1];
+
+    auto s = make_tensor(make_smem_ptr(rawS), slay3);  // (HTILE,HTILE,1)   条件 4
+    auto s2 = s(_, _, Int<0>{});
+    // 转置视图: 读 sT 的行 = 读 s 的列 (v1 §4 的招)
+    auto sT = make_tensor(make_smem_ptr(rawS), stlay);
+
+    // 条件 1: 坐标 tensor
+    auto mA = tma.get_tma_tensor(make_shape(HALF_M, HALF_N));
+    auto gA = local_tile(mA, Shape<Int<HTILE>, Int<HTILE>>{}, make_coord(blockIdx.y, blockIdx.x));
+    // 条件 5: tma_partition
+    auto p = tma_partition(tma, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(s),
+                           group_modes<0, 2>(gA));
+    auto tAg = get<0>(p);
+    auto tAs = get<1>(p);
+    constexpr int txb = sizeof(make_tensor_like(tensor<0>(tAs)));
+
+    int warp = cutlass::canonical_warp_idx_sync();
+    int one = cute::elect_one_sync();
+    using Bar = cutlass::arch::ClusterTransactionBarrier;
+    if (warp == 0 && one) Bar::init(&bar[0], 1);
+    cutlass::arch::fence_barrier_init();
+    __syncthreads();
+
+    if (warp == 0 && one) {
+        Bar::arrive_and_expect_tx(&bar[0], txb);
+        copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{}));  // 一条指令搬整块
+    }
+    Bar::wait(&bar[0], 0);
+    __syncthreads();
+
+    // store: 转置视图 -> gmem, 标量读 (转置视图下 smem 不连续, 不能向量化)
+    auto thr = tc.get_slice(threadIdx.x);
+    auto mOut = make_tensor(make_gmem_ptr(out),
+                            make_layout(make_shape(HALF_N, HALF_M), make_stride(HALF_M, Int<1>{})));
+    auto gOut = local_tile(mOut, Shape<Int<HTILE>, Int<HTILE>>{}, make_coord(blockIdx.x, blockIdx.y));
+    copy(tc, thr.partition_S(sT), thr.partition_D(gOut));
+}
+
+static Result run_tma() {
+    printf("\nv6  TMA 版转置  (half %dx%d, tile %d, 各 CTA 一个 lane 发 TMA)\n", HALF_M, HALF_N,
+           HTILE);
+
+    size_t bytes = size_t(HALF_M) * HALF_N * sizeof(half_t);
+    half_t *d_a, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, bytes));
+    half_t* h_a = new half_t[size_t(HALF_M) * HALF_N];
+    half_t* h_out = new half_t[size_t(HALF_M) * HALF_N];
+    for (size_t i = 0; i < size_t(HALF_M) * HALF_N; ++i) h_a[i] = half_t(float(i % 1024));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_out, 0, bytes));
+
+    // host 侧: 条件 2 用真实指针建 descriptor; 条件 4 传 PIPE 切片
+    auto gm = make_tensor(make_gmem_ptr(d_a),
+                          make_layout(make_shape(HALF_M, HALF_N), make_stride(HALF_N, Int<1>{})));
+    auto slay3 = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
+                               make_shape(Int<HTILE>{}, Int<HTILE>{}, Int<1>{}));
+    auto tma = make_tma_atom(SM90_TMA_LOAD{}, gm, slay3(_, _, Int<0>{}),
+                             make_shape(Int<HTILE>{}, Int<HTILE>{}));
+    auto stlay = composition(slay3(_, _, Int<0>{}),
+                             make_layout(make_shape(Int<HTILE>{}, Int<HTILE>{}),
+                                         make_stride(Int<HTILE>{}, Int<1>{})));
+    auto tc = make_tiled_copy(Copy_Atom<UniversalCopy<half_t>, half_t>{},
+                              make_layout(make_shape(Int<16>{}, Int<8>{}),
+                                          make_stride(Int<8>{}, Int<1>{})),
+                              make_layout(make_shape(Int<1>{}, Int<1>{})));  // 标量读
+
+    dim3 block(HNTHR), cluster(1, 1, 1), grid(HALF_N / HTILE, HALF_M / HTILE);
+    cutlass::ClusterLaunchParams params{grid, block, cluster, 0};
+    void const* kptr = reinterpret_cast<void const*>(
+        &transpose_tma<decltype(tma), decltype(slay3), decltype(stlay), decltype(tc)>);
+
+    float ms = time_kernel(
+        [&] { cutlass::launch_kernel_on_cluster(params, kptr, tma, slay3, stlay, tc, d_out); },
+        5, 100);
+
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int i = 0; i < HALF_M; i += 13)
+        for (int j = 0; j < HALF_N; j += 11)
+            if (h_out[size_t(j) * HALF_M + i] != h_a[size_t(i) * HALF_N + j]) ok = false;
+
+    printf("    转置结果 %s    %.4f ms   %.1f GB/s\n", ok ? "正确" : "错误", ms,
+           transpose_bandwidth_gbs(size_t(HALF_M) * HALF_N, sizeof(half_t), ms));
+    printf("    (half/%d^2, 和 v1-v5 的 float/8192^2 不可直接比 —— 见上面的说明)\n", HALF_M);
+
+    cudaFree(d_a);
+    cudaFree(d_out);
+    delete[] h_a;
+    delete[] h_out;
+    return {"TMA (half)", ms, ok};
+}
+
+// ===========================================================================
+// main —— 按顺序跑六版, 汇总
 // ===========================================================================
 int main() {
     printf("cute_04 capstone —— %dx%d float 转置\n", M, N);
@@ -249,6 +368,13 @@ int main() {
 
     printf("\n  读一遍 + 写一遍 = %.1f GB, 本机 HBM 理论带宽约 4.9 TB/s\n",
            2.0 * Buffers::bytes / 1e9);
+
+    print_separator("v6: TMA 版转置 (单独展示, 证明搬运这步能交给硬件)");
+    run_tma();
+    printf("\n  为什么 v6 不在上面的 float 表里:\n");
+    printf("    TMA 的 SW128 descriptor 天生是 16-bit 的 (v2 §5.3), 用 float 要另配几何;\n");
+    printf("    而且 TMA 擅长的是\"整块搬进 smem 喂 WGMMA\"(v3 的流水线已经证明),\n");
+    printf("    不是纯转置这种转换操作 —— 后者瓶颈在 bank 冲突, 不在搬运指令。\n");
 
     printf("\ncapstone OK\n");
     return 0;
