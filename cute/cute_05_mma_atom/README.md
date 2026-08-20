@@ -1,7 +1,7 @@
 # cute_05 · MMA Atom：Tensor Core 是什么，以及 Hopper 改了什么
 
 > 前置：cute_01（Layout）、cute_02（Tensor）、cute_03（Copy Atom）、
-> cute_04（Swizzle → CuTe 搬运 → TMA → Multi-stage）。
+> cute_04（TMA → 边界 → Swizzle → Multi-stage）。
 >
 > 这一章是**从"搬数据"跳到"算数据"** 的关口。
 > 读这一章时你会反复被要求"回 cute_04 看一眼"—— 因为搬运和计算在 Hopper 上
@@ -248,11 +248,11 @@ __syncthreads()                     copy(tma_b.with(bar), gB, sB)
 2. **寄存器**：搬数据不再需要存地址和 in-flight 数据。WGMMA 的累加器已经占了
    每线程 32 个 float，这很关键。
 3. **同步粒度**：`__syncthreads`（全 block 栅栏）→ `mbarrier`（按字节数等）。
-   这是能做 producer/consumer、能做多 stage 流水线的**前提**（cute_04 §6）。
+   这是能做 producer/consumer、能做多 stage 流水线的**前提**（cute_04 §5）。
 
 ### §4.2 五个硬性条件
 
-cute_04 §5.2 讲全了，这一章只在 `cute_mma_v2.cu` 里逐条标了位置。五个条件：
+cute_04 §2 讲全了，这一章只在 `cute_mma_v2.cu` 里逐条标了位置。五个条件：
 
 1. **src 必须是 `tma.get_tma_tensor(shape)` 的坐标 tensor** —— 不是普通 gmem tensor。
 2. **descriptor 必须 host 侧用真实设备指针构造**。
@@ -262,10 +262,10 @@ cute_04 §5.2 讲全了，这一章只在 `cute_mma_v2.cu` 里逐条标了位置
 
 > 提醒：`elect_one_sync()` 是**每个 warp 选一个 lane**，不是全 block 选一个。
 > 跨多个 warpgroup 时一定要再限定 `(one && warp == leader)`，否则会有
-> 多个 lane 同时发 TMA —— 详见 cute_04 §6.4 和练习。
+> 多个 lane 同时发 TMA —— 详见 cute_04 §5.4 和练习。
 
 > 诚实的话：这一版**没有变快**。搬完才算、算完才搬，两个引擎各闲一半。
-> TMA 的价值要等它和多 stage 组合才兑现（cute_04 §6），cute_06 会铺满 grid。
+> TMA 的价值要等它和多 stage 组合才兑现（cute_04 §5），cute_06 会铺满 grid。
 
 ---
 
@@ -350,7 +350,7 @@ cute_05_mma_atom/
 
 **下一步 (cute_06)**：capstone 只剩没做重叠。cute_06 从 naive 一路上来——
 v0 naive GEMM → v1 smem → v2 多 stage `cp.async` → **v3 TMA+WGMMA 多 stage
-（cute_04 §6 骨架铺满 grid）** → **v4 Warp Specialization** → v5 Block Cluster。
+（cute_04 §5 骨架铺满 grid）** → **v4 Warp Specialization** → v5 Block Cluster。
 终端是对标 cuBLAS。你已经拿到全部零件，cute_06 是把它们拧成一台机器。
 
 ---

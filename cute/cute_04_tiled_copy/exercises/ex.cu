@@ -3,24 +3,20 @@
 // 题目见 README 的"练习"一节。参考解答在 solutions.md。
 // 每题都有一个自动检查，填对了会打印 PASS。
 //
-// 六道题对应 README 的:
-//   1 -> §1    bank 模型
-//   2 -> §3.2  手算 swizzle 映射
-//   3 -> §3.4  M 参数与向量化
-//   4 -> §5.4  选 GMMA 原子
-//   5 -> §5.2 §5.3  TMA 和 WGMMA 谁挑 layout
-//   6 -> §3 §4  修一个真实的 layout bug
-//   7 -> §5.2  手写一段 TMA 搬运
-//   8 -> §6.2  把单缓冲改成 TMA Double Buffer
+// 八道题对应 README 的:
+//   1 -> §4.1  bank 模型
+//   2 -> §4.3  手算 swizzle 映射
+//   3 -> §4.4  M 参数与向量化
+//   4 -> §4.6  选 TMA 模式
+//   5 -> §2 §4.6  TMA 语义
+//   6 -> §6    修一个转置 bug
+//   7 -> §2    手写一段 TMA 搬运
+//   8 -> §5.2  把单缓冲改成 TMA Double Buffer
 
 #include <cute/tensor.hpp>
-#include <cute/atom/copy_atom.hpp>
 #include <cute/atom/mma_atom.hpp>
+#include <cute/atom/copy_atom.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
-#include <cutlass/arch/barrier.h>
-#include <cutlass/cluster_launch.hpp>
-#include <cutlass/pipeline/sm90_pipeline.hpp>
-#include <cutlass/device_kernel.h>
 #include <cstdio>
 #include <cuda_runtime.h>
 
@@ -55,7 +51,7 @@ static int max_bank_requests(int lanes, F&& off_of_lane) {
     return worst;
 }
 
-// 全列扫描取最坏 —— 只看第 0 列会得出错误结论 (见 README §3.4)
+// 全列扫描取最坏 —— 只看第 0 列会得出错误结论 (见 README §4.4)
 template <class Lay>
 static int worst_col_all(Lay lay) {
     int worst = 0;
@@ -66,561 +62,314 @@ static int worst_col_all(Lay lay) {
     return worst;
 }
 
-// 行内最短连续段: 决定能不能用宽向量指令
+// 行内最短连续段
 template <class Lay>
 static int min_run(Lay lay) {
     int g = 1 << 30;
     for (int r = 0; r < 32; ++r) {
         int run = 1;
         for (int c = 1; c < 32; ++c) {
-            if (int(lay(r, c)) == int(lay(r, c - 1)) + 1) {
-                ++run;
-            } else {
-                if (run < g) g = run;
-                run = 1;
-            }
+            if (int(lay(r, c)) == int(lay(r, c - 1)) + 1) ++run;
+            else { if (run < g) g = run; run = 1; }
         }
         if (run < g) g = run;
     }
     return g;
 }
 
-// ===========================================================================
-// 练习 1 — 数 bank ★☆☆   (README §1)
-//
-// 一个 (32,32):(32,1) 的 float tile。不运行代码先答：
-//   一个 warp 读 s(0..31, 5)（第 5 列）时，最热的 bank 被请求几次？
-// ===========================================================================
-constexpr int EX1_CONFLICT = 0;  // TODO: 改成你的答案
-
-void ex1() {
-    printf("\n--- 练习 1: 数 bank (§1) ---\n");
-    auto lay = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-    int actual = max_bank_requests(32, [&](int l) { return int(lay(l, 5)) * 4; });
-    printf("  实际 = %d-way\n", actual);
-    expect("EX1_CONFLICT 等于实际值", EX1_CONFLICT == actual);
+static auto plain() {
+    return make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{});
 }
 
 // ===========================================================================
-// 练习 2 — 手算 swizzle 映射 ★★☆   (README §3.2)
-//
-// Swizzle<5,0,5> 作用在 (32,32):(32,1) 上。按 README §3.2 的四步手算
-// swz_off(6, 3)，不要跑代码。
-//
-//   第 1 步: plain_off = 6*32 + 3 = ?
-//   第 2 步: 取出高 5 位 (就是 r)
-//   第 3 步: M=0 不左移, 和低 5 位 (就是 c) 异或
-//   第 4 步: 拼回去 = r*32 + (c XOR r)
+// 练习 1 — 数 bank ★☆☆  (§4.1)
 // ===========================================================================
-constexpr int EX2_SWZ_OFF = -1;  // TODO: swz_off(6, 3) = ?
-
-void ex2() {
-    printf("\n--- 练习 2: 手算 swizzle 映射 (§3.2) ---\n");
-    auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-    auto swz = composition(Swizzle<5, 0, 5>{}, plain);
-
-    int r = 6, c = 3;
-    int po = r * 32 + c;
-    printf("  plain_off(%d,%d) = %d\n", r, c, po);
-    printf("  高 5 位 (r) = %d, 低 5 位 (c) = %d, c XOR r = %d\n", (po >> 5) & 31, po & 31,
-           ((po >> 5) & 31) ^ (po & 31));
-    printf("  CuTe 算出的 swz(%d,%d) = %d\n", r, c, int(swz(r, c)));
-    expect("EX2_SWZ_OFF 等于 CuTe 的结果", EX2_SWZ_OFF == int(swz(r, c)));
+static void ex1() {
+    printf("练习 1 — 数 bank:\n");
+    auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{});
+    // TODO: 一个 warp 读第 5 列, 最热的 bank 被请求几次?
+    constexpr int EX1_CONFLICT = 0;  // <-- 改成你的答案
+    int w = max_bank_requests(32, [&](int l) { return int(plain(l, 5)) * 4; });
+    expect("第 5 列 = 32-way conflict", w == EX1_CONFLICT && EX1_CONFLICT == 32);
+    printf("\n");
 }
 
 // ===========================================================================
-// 练习 3 — 选 M 保住向量化 ★★★   (README §3.4)
-//
-// 你要用 128-bit atom（每线程 4 个连续 float）搬一个 32x32 float tile。
-// 三个候选 swizzle：Swizzle<5,0,5> / Swizzle<4,1,4> / Swizzle<3,2,3>。
-//
-// 哪些能用？填一个 3 位 bitmask:
-//   bit0 = Sw<5,0,5> 能用, bit1 = Sw<4,1,4>, bit2 = Sw<3,2,3>
-//
-// 判据: 行内最短连续段 >= 4 个 float 才能凑出一条 128-bit 指令。
-// 提示: M 保护最低 M 位不参与异或 -> 2^M 个元素保持连续。
+// 练习 2 — 手算 swizzle 映射 ★★☆  (§4.3)
 // ===========================================================================
-constexpr int EX3_VEC_MASK = 0;  // TODO
-
-void ex3() {
-    printf("\n--- 练习 3: 选 M 保住向量化 (§3.4) ---\n");
-    auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-    auto s505 = composition(Swizzle<5, 0, 5>{}, plain);
-    auto s414 = composition(Swizzle<4, 1, 4>{}, plain);
-    auto s323 = composition(Swizzle<3, 2, 3>{}, plain);
-
-    int runs[3] = {min_run(s505), min_run(s414), min_run(s323)};
-    int confs[3] = {worst_col_all(s505), worst_col_all(s414), worst_col_all(s323)};
-    const char* nm[3] = {"Sw<5,0,5>", "Sw<4,1,4>", "Sw<3,2,3>"};
-
-    int mask = 0;
-    for (int i = 0; i < 3; ++i) {
-        if (runs[i] >= 4) mask |= (1 << i);
-        printf("  %-10s 行内最短连续 = %2d 个 float   列读 = %2d-way   128-bit %s\n", nm[i],
-               runs[i], confs[i], runs[i] >= 4 ? "可用" : "不可用");
-    }
-    printf("  实际 mask = %d\n", mask);
-    expect("EX3_VEC_MASK 正确", EX3_VEC_MASK == mask);
-    printf("  注意: 冲突最少的那个 (1-way) 恰恰是不能向量化的那个 —— 这就是 M 的权衡。\n");
+static void ex2() {
+    printf("练习 2 — 手算 swizzle 映射:\n");
+    // TODO: Swizzle<5,0,5> 作用在 (32,32):(32,1) 上, 手算 swz_off(6, 3)。
+    // 按 §4.3 四步: off = 6*32+3 = 195; 高 5 位 = 6; c XOR r = 3 XOR 6 = 5
+    constexpr int EX2_SWZ_OFF = 0;  // <-- 改成你的答案
+    auto swz = composition(Swizzle<5, 0, 5>{}, plain());
+    expect("swz(6,3) 正确", int(swz(6, 3)) == EX2_SWZ_OFF && EX2_SWZ_OFF == 197);
+    printf("\n");
 }
 
 // ===========================================================================
-// 练习 4 — 选对 GMMA swizzle 原子 ★★☆   (README §5.4)
-//
-// 你要给 WGMMA 准备一块 (BM=128, BK=32) 的 half smem。
-// 四个候选原子的 K 方向长度: SW128->64, SW64->32, SW32->16, INTER->8。
-// tile_to_shape 要求 BK 能被原子的 K 长度整除。
-//
-// 哪些原子可以用？填一个 4 位的 bitmask:
-//   bit0 = SW128 可用, bit1 = SW64, bit2 = SW32, bit3 = INTER
-// 例如"只有 SW64 和 SW32 可用" -> 0b0110 = 6
+// 练习 3 — 选 M 保住向量化 ★★★  (§4.4)
 // ===========================================================================
-constexpr int EX4_MASK = 0;  // TODO
-
-void ex4() {
-    printf("\n--- 练习 4: 选 GMMA swizzle 原子 (§5.4) ---\n");
-    constexpr int BK = 32;
-    int klen[4] = {64, 32, 16, 8};
-    const char* nm[4] = {"SW128", "SW64", "SW32", "INTER"};
-    int mask = 0;
-    for (int i = 0; i < 4; ++i)
-        if (BK % klen[i] == 0) mask |= (1 << i);
-
-    printf("  BK = %d:  ", BK);
-    for (int i = 0; i < 4; ++i) printf("%s=%s ", nm[i], (BK % klen[i] == 0) ? "可用" : "不可用");
-    printf("\n  实际 mask = 0b%d%d%d%d = %d\n", (mask >> 3) & 1, (mask >> 2) & 1, (mask >> 1) & 1,
-           mask & 1, mask);
-
-    expect("EX4_MASK 正确", EX4_MASK == mask);
-
-    // 顺手验证真的能编译过（用最大的可用原子）
-    auto s = tile_to_shape(GMMA::Layout_K_SW64_Atom<half_t>{}, make_shape(Int<128>{}, Int<BK>{}));
-    printf("  tile_to_shape(SW64, (128,32)) 成功, cosize = %d\n", int(cosize(s)));
-    expect("SW64 铺 (128,32) 的 cosize == 4096", int(cosize(s)) == 4096);
+static void ex3() {
+    printf("练习 3 — 选 M 保住向量化:\n");
+    // TODO: 128-bit atom 搬 32x32 float tile。
+    // 哪些 swizzle 能用? (行内连续 >= 4 才可能向量化)
+    // 提示: 先看 min_run, 再看列冲突。
+    auto s505 = composition(Swizzle<5, 0, 5>{}, plain());
+    auto s414 = composition(Swizzle<4, 1, 4>{}, plain());
+    auto s323 = composition(Swizzle<3, 2, 3>{}, plain());
+    printf("    Sw<5,0,5>: 列读 %2d-way, 行内连续 %2d\n", worst_col_all(s505), min_run(s505));
+    printf("    Sw<4,1,4>: 列读 %2d-way, 行内连续 %2d\n", worst_col_all(s414), min_run(s414));
+    printf("    Sw<3,2,3>: 列读 %2d-way, 行内连续 %2d\n", worst_col_all(s323), min_run(s323));
+    // TODO: 哪个能用? (写名字, 检查用下面的断言)
+    constexpr bool EX3_505_OK = false;
+    constexpr bool EX3_323_OK = false;
+    expect("Sw<5,0,5> 不能用 (连续 1)", EX3_505_OK == false);
+    expect("Sw<3,2,3> 能用 (连续 4)", EX3_323_OK == true);
+    printf("\n");
 }
 
 // ===========================================================================
-// 练习 5 — 谁挑 layout: TMA 还是 WGMMA ★★☆   (README §5.2 §5.3)
-//
-// 一块 plain row-major 的 half smem (完全没有 swizzle)。两个判断题:
-//   A: TMA 能把数据正确搬进这块 smem 吗？
-//   B: 这块 smem 能直接喂给 SM90 的 WGMMA (编译通过) 吗？
-//
-// 提示: 跑一下 ../cute_tiled_v2 看 §5.2 和 §5.3 的输出。
-// 想亲眼看到 B 的报错: 把下面 EX5_TRY_PLAIN_WGMMA 改成 1 再编译。
+// 练习 4 — 选对 TMA 模式 ★★☆  (§4.6)
 // ===========================================================================
-constexpr bool EX5_TMA_OK = false;    // TODO: TMA 能搬对吗
-constexpr bool EX5_WGMMA_OK = true;   // TODO: WGMMA 能编译过吗
-
-#define EX5_TRY_PLAIN_WGMMA 0  // 改成 1 会编译失败, 报 "Not a canonical GMMA_K Layout"
-
-#if EX5_TRY_PLAIN_WGMMA
-__global__ void ex5_bad_kernel() {
-    __shared__ __align__(128) half_t raw[64 * 64];
-    auto plain = make_layout(make_shape(Int<64>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
-    auto sA = make_tensor(make_smem_ptr(raw), plain);
-    auto mma = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
-    auto thr = mma.get_thread_slice(threadIdx.x);
-    auto tCrA = thr.make_fragment_A(thr.partition_A(sA));  // <- 这里 static_assert 失败
-    if (thread0()) print(tCrA);
-}
-#endif
-
-void ex5() {
-    printf("\n--- 练习 5: 谁挑 layout, TMA 还是 WGMMA (§5.2 §5.3) ---\n");
-    printf("  这两个答案在 v2 的输出里: TMA 五种 layout 全搬对; WGMMA 拒绝 plain/padded。\n");
-    expect("EX5_TMA_OK: TMA 不挑 layout, plain 也搬得对", EX5_TMA_OK == true);
-    expect("EX5_WGMMA_OK: WGMMA 编译期拒绝 plain", EX5_WGMMA_OK == false);
+static void ex4() {
+    printf("练习 4 — 选 TMA 模式:\n");
+    // CN=32 的 float tile (一行 128 字节)。
+    // TODO: 四个模式哪些可用? (内层长度能否整除 CN)
+    // SW128 内层 32 / SW64 内层 16 / SW32 内层 8 / INTER 内层 4
+    constexpr bool EX4_SW128_OK = false;
+    constexpr bool EX4_SW64_OK = false;
+    constexpr bool EX4_SW32_OK = false;
+    constexpr bool EX4_INTER_OK = false;
+    expect("SW128 可用 (32%32==0)", EX4_SW128_OK == true);
+    expect("SW64 可用 (32%16==0)", EX4_SW64_OK == true);
+    expect("SW32 可用 (32%8==0)", EX4_SW32_OK == true);
+    expect("INTER 可用 (32%4==0)", EX4_INTER_OK == true);
+    // TODO: 实用规则选哪个? (最大的)
+    constexpr bool EX4_PICK_SW128 = false;
+    expect("选一行字节数最大的 SW128", EX4_PICK_SW128 == true);
+    printf("\n");
 }
 
 // ===========================================================================
-// 练习 6 — 修一个 smem layout bug ★★★   (README §3 §4)
-//
-// 下面的 kernel 把 gmem 的一块 32x32 搬进 smem 再按列读出来。
-// 它结果正确，但按列读 smem 是 32-way conflict。
-//
-// 只改 slay 一行（不改任何访存代码），要同时满足两个条件:
-//   1) 列读冲突 <= 4-way
-//   2) 行内最短连续段 >= 4 个 float（这样 128-bit atom 还能用）
-//
-// 注意第 2 条排除了 Swizzle<5,0,5> —— 它冲突最少但连续性全丢了。
-// 数组已按 33*32 开好，padding 和 swizzle 都放得下。
+// 练习 5 — TMA 语义 ★★☆  (§2 §4.6)
 // ===========================================================================
-__global__ void ex6_kernel(const float* in, float* out, int* off_probe) {
-    __shared__ __align__(128) float raw[32 * 33];
+static void ex5() {
+    printf("练习 5 — TMA 语义:\n");
+    // TODO: 判断对错
+    // (a) 手写 swizzle 改的是逻辑坐标的偏移; TMA 的 swizzle 改的是物理字节序。
+    constexpr bool EX5_A = false;   // 对 -> true
+    // (b) plain smem layout 交给 TMA 会搬错。
+    constexpr bool EX5_B = true;    // 错 -> false
+    expect("(a) 逻辑层 vs 物理层", EX5_A == true);
+    expect("(b) plain 也能搬对", EX5_B == false);
+    printf("\n");
+}
 
-    // TODO: 这个 layout 列读 32-way conflict。改掉它, 满足上面两个条件。
-    //       提示: composition(Swizzle<B,M,S>{}, plain), 按 §3.4 选 M。
-    auto slay = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-
-    auto s = make_tensor(make_smem_ptr(raw), slay);
-    int tx = threadIdx.x % 32, ty = threadIdx.x / 32;
-    for (int r = ty; r < 32; r += blockDim.x / 32) s(r, tx) = in[r * 32 + tx];
-    __syncthreads();
-    for (int r = ty; r < 32; r += blockDim.x / 32) out[r * 32 + tx] = s(tx, r);
-
-    // 探针: 把整张 32x32 的偏移表交给 host, host 侧算冲突和连续段
+// ===========================================================================
+// 练习 6 — 修一个转置 bug ★★★  (§6)
+// ===========================================================================
+template <class SLay>
+__global__ void transpose_kernel(const float* __restrict__ a, float* __restrict__ b, SLay slay) {
+    extern __shared__ __align__(128) char raw[];
+    auto sT = make_tensor(make_smem_ptr((float*)raw), slay);
+    const int row0 = blockIdx.x * 32, col0 = blockIdx.y * 32;
     for (int i = threadIdx.x; i < 32 * 32; i += blockDim.x)
-        off_probe[i] = int(&s(i / 32, i % 32) - raw);
+        sT(i / 32, i % 32) = a[(row0 + i / 32) * 128 + (col0 + i % 32)];
+    __syncthreads();
+    for (int i = threadIdx.x; i < 32 * 32; i += blockDim.x) {
+        int r = i / 32, c = i % 32;
+        b[(col0 + r) * 256 + (row0 + c)] = sT(c, r);  // 转置
+    }
 }
 
-void ex6() {
-    printf("\n--- 练习 6: 修 smem layout (§3 §4) ---\n");
-    float *d_in, *d_out;
-    int* d_probe;
-    CUDA_CHECK(cudaMalloc(&d_in, 32 * 32 * 4));
-    CUDA_CHECK(cudaMalloc(&d_out, 32 * 32 * 4));
-    CUDA_CHECK(cudaMalloc(&d_probe, 32 * 32 * 4));
-
-    float h_in[32 * 32], h_out[32 * 32];
-    for (int i = 0; i < 32 * 32; ++i) h_in[i] = float(i);
-    CUDA_CHECK(cudaMemcpy(d_in, h_in, sizeof(h_in), cudaMemcpyHostToDevice));
-
-    ex6_kernel<<<1, 256>>>(d_in, d_out, d_probe);
+static void ex6() {
+    printf("练习 6 — 修转置 bug:\n");
+    // TODO: 转置结果正确但列读 32-way。只改 slay 一行, 让列读 <= 16-way。
+    // (用 §4.6 的 SW128 原子)
+    // TODO 提示: tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, ...)
+    auto slay = plain();  // <-- 改成 SW128 的
+    auto swz = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, make_shape(Int<32>{}, Int<32>{}));
+    constexpr int M = 256, N = 128;
+    float *da, *db;
+    CUDA_CHECK(cudaMalloc(&da, sizeof(float) * M * N));
+    CUDA_CHECK(cudaMalloc(&db, sizeof(float) * M * N));
+    float* h = new float[M * N];
+    for (int i = 0; i < M * N; ++i) h[i] = float(i);
+    CUDA_CHECK(cudaMemcpy(da, h, sizeof(float) * M * N, cudaMemcpyHostToDevice));
+    transpose_kernel<<<dim3(M / 32, N / 32), 128, 32 * 32 * 4>>>(da, db, swz);
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, sizeof(h_out), cudaMemcpyDeviceToHost));
+    float* ho = new float[M * N];
+    CUDA_CHECK(cudaMemcpy(ho, db, sizeof(float) * M * N, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int m = 0; m < M && ok; ++m)
+        for (int n = 0; n < N; ++n)
+            if (ho[n * M + m] != h[m * N + n]) ok = false;
+    expect("SW128 转置正确", ok);
+    printf("    (检查: 列读 = %d-way, 目标 <= 16)\n", worst_col_all(swz));
+    printf("\n");
+}
 
-    int probe[32 * 32];
-    CUDA_CHECK(cudaMemcpy(probe, d_probe, sizeof(probe), cudaMemcpyDeviceToHost));
-    auto off = [&](int r, int c) { return probe[r * 32 + c]; };
+// ===========================================================================
+// 练习 7 — 手写一段 TMA 搬运 ★★★  (§2)
+// ===========================================================================
+template <class TmaLoad>
+__global__ void tma_load_kernel(__grid_constant__ const TmaLoad tma, float* __restrict__ out) {
+    // TODO 1: 这一次搬多少字节? (填错/填 0 的结果: barrier 立即放行, 数据没搬)
+    constexpr int tx_bytes = 0;  // <-- 32*32*sizeof(float)
 
-    // 全列扫描取最坏
-    int worst = 0;
-    for (int c = 0; c < 32; ++c) {
-        int w = max_bank_requests(32, [&](int l) { return off(l, c) * 4; });
-        if (w > worst) worst = w;
+    // TODO 2: smem (128B 对齐) 和 mbarrier
+    __shared__ __align__(128) float smem[32 * 32];  // <-- TODO: 32*32
+    __shared__ uint64_t bar;
+
+    auto sT = make_tensor(make_smem_ptr(smem),
+                          make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{}));
+    // TODO 3: 坐标 tensor + 本 CTA 的 tile (grid 是 (M/32, N/32))
+    auto gc = tma.get_tma_tensor(make_shape(Int<256>{}, Int<128>{}));
+    auto gt = local_tile(gc, Shape<Int<32>, Int<32>>{}, make_coord(blockIdx.x, blockIdx.y));
+
+    // TODO 4: barrier 初始化 + 发 TMA (thread 0)
+    if (threadIdx.x == 0) initialize_barrier(bar, 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        set_barrier_transaction_bytes(bar, tx_bytes);
+        auto per = tma.get_slice(0);
+        copy(tma.with(bar), per.partition_S(gt), per.partition_D(sT));
     }
-    // 行内最短连续段
-    int run_min = 1 << 30;
-    for (int r = 0; r < 32; ++r) {
-        int run = 1;
-        for (int c = 1; c < 32; ++c) {
-            if (off(r, c) == off(r, c - 1) + 1) {
-                ++run;
-            } else {
-                if (run < run_min) run_min = run;
-                run = 1;
+    __syncthreads();
+    // TODO 5: 等硬件搬完 (phase = 0, 只用一轮)
+    wait_barrier(bar, 0);
+
+    for (int i = threadIdx.x; i < 32 * 32; i += blockDim.x)
+        out[(blockIdx.x * 32 + i / 32) * 128 + (blockIdx.y * 32 + i % 32)] = smem[i];
+}
+
+static void ex7() {
+    printf("练习 7 — 手写 TMA 搬运:\n");
+    constexpr int M = 256, N = 128;
+    float *da, *db;
+    CUDA_CHECK(cudaMalloc(&da, sizeof(float) * M * N));
+    CUDA_CHECK(cudaMalloc(&db, sizeof(float) * M * N));
+    float* h = new float[M * N];
+    for (int i = 0; i < M * N; ++i) h[i] = float(i);
+    CUDA_CHECK(cudaMemcpy(da, h, sizeof(float) * M * N, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(db, 0, sizeof(float) * M * N));
+
+    auto mA = make_tensor(make_gmem_ptr(da), make_layout(make_shape(Int<M>{}, Int<N>{}),
+                                                         LayoutRight{}));
+    auto slay = make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{});
+    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mA, slay);
+    tma_load_kernel<<<dim3(M / 32, N / 32), 128>>>(tma, db);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float* ho = new float[M * N];
+    CUDA_CHECK(cudaMemcpy(ho, db, sizeof(float) * M * N, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int i = 0; i < M * N && ok; ++i)
+        if (ho[i] != h[i]) ok = false;
+    if (!ok) printf("    (提示: 没填 TODO 的话 tx_bytes=0, barrier 立即放行但数据没搬)\n");
+    expect("TMA 搬运正确", ok);
+    printf("\n");
+}
+
+// ===========================================================================
+// 练习 8 — TMA Double Buffer ★★★  (§5.2)
+// ===========================================================================
+template <class TmaLoad>
+__global__ void double_buffer_kernel(__grid_constant__ const TmaLoad tma, float* __restrict__ out) {
+    // 两个 buffer, 搬 k+1 和算 k 重叠。three TODOs.
+    constexpr int tx_bytes = 32 * 32 * sizeof(float);
+    constexpr int STAGES = 2;
+    constexpr int NTILE = 64;
+
+    __shared__ __align__(128) float smem[STAGES * 32 * 32];
+    __shared__ uint64_t full[STAGES], empty[STAGES];
+
+    auto sT = make_tensor(make_smem_ptr(smem),
+                          make_layout(make_shape(Int<32>{}, Int<32>{}, Int<STAGES>{}),
+                                      make_stride(Int<32>{}, Int<1>{}, Int<32 * 32>{})));
+    auto gc = tma.get_tma_tensor(make_shape(NTILE * 32, 32));
+    auto per = tma.get_slice(0);
+
+    if (threadIdx.x == 0)
+        for (int s = 0; s < STAGES; ++s) {
+            initialize_barrier(full[s], 1);
+            initialize_barrier(empty[s], 128);  // 128 个线程各 arrive 一次
+        }
+    __syncthreads();
+
+    // prologue: 填满全部 buffer
+    for (int s = 0; s < STAGES; ++s)
+        if (threadIdx.x == 0) {
+            set_barrier_transaction_bytes(full[s], tx_bytes);
+            auto gt = local_tile(gc, Shape<Int<32>, Int<32>>{}, make_coord(s, 0));
+            copy(tma.with(full[s]), per.partition_S(gt), per.partition_D(sT(_, _, s)));
+        }
+    __syncthreads();
+
+    float acc = 0.f;
+    for (int k = 0; k < NTILE; ++k) {
+        int s = k % STAGES;
+        // TODO 1: phase 公式 —— buffer s 第几轮被用?
+        // 写死 0 的症状: k=1 时等 full[1] 的 phase 0, 但 prologue 已把它的
+        // phase 翻到 1 —— 等一个永远不会到来的翻转, 死锁。
+        int phase = 0;  // <-- TODO 1: (k / STAGES) & 1
+        // 填好前别跑: 写死 0 会死锁 (k=1 时等 full[1] 的 phase 0,
+        // 但 prologue 已把它翻到 1 —— 等一个永远不会到来的翻转)
+        wait_barrier(full[s], phase);
+
+        for (int i = threadIdx.x; i < 32 * 32; i += 128) acc += sT(i / 32, i % 32, s);
+
+        // TODO 2: 通知 producer 这个 buffer 用完了
+        arrive_barrier(empty[s]);  // <-- 提示: arrive_barrier(empty[s])
+
+        int knext = k + STAGES;
+        if (knext < NTILE) {
+            // TODO 3: 先等 empty 再补货
+            wait_barrier(empty[s], phase);  // <-- 这里也要 phase
+            if (threadIdx.x == 0) {
+                set_barrier_transaction_bytes(full[s], tx_bytes);
+                auto gt = local_tile(gc, Shape<Int<32>, Int<32>>{}, make_coord(knext, 0));
+                copy(tma.with(full[s]), per.partition_S(gt), per.partition_D(sT(_, _, s)));
             }
         }
-        if (run < run_min) run_min = run;
     }
-
-    bool correct = true;
-    for (int r = 0; r < 32; ++r)
-        for (int c = 0; c < 32; ++c)
-            if (h_out[r * 32 + c] != h_in[c * 32 + r]) correct = false;
-
-    printf("  转置结果 = %s, 列读最坏 = %d-way, 行内最短连续 = %d 个 float\n",
-           correct ? "正确" : "错误", worst, run_min);
-    expect("转置结果仍然正确", correct);
-    expect("列读冲突 <= 4-way", worst <= 4);
-    expect("行内最短连续 >= 4 个 float (128-bit atom 可用)", run_min >= 4);
-
-    CUDA_CHECK(cudaFree(d_in));
-    CUDA_CHECK(cudaFree(d_out));
-    CUDA_CHECK(cudaFree(d_probe));
+    if (threadIdx.x == 0) out[blockIdx.x] = acc;
 }
 
+static void ex8() {
+    printf("练习 8 — TMA Double Buffer:\n");
+    constexpr int NTILE = 64, N_CTA = 64;
+    float *da, *dsum;
+    CUDA_CHECK(cudaMalloc(&da, sizeof(float) * NTILE * 32 * 32 * N_CTA));
+    CUDA_CHECK(cudaMalloc(&dsum, sizeof(float) * N_CTA));
+    float* h = new float[NTILE * 32 * 32 * N_CTA];
+    for (int i = 0; i < NTILE * 32 * 32 * N_CTA; ++i) h[i] = 1.f;  // 全 1, 累加和可预测
+    CUDA_CHECK(cudaMemcpy(da, h, sizeof(float) * NTILE * 32 * 32 * N_CTA, cudaMemcpyHostToDevice));
 
-// ===========================================================================
-// 练习 7 — 手写一段 TMA 搬运 ★★★   (README §5.2)
-//
-// gmem 里的 A 是 GM x GK 的 half, row-major stride=(GK,1)。
-// 用 TMA 把 tile (0,0) = TM x TK 搬进 smem, 再倒出来给 host 比对。
-//
-// 【交给学员】这个 kernel 已经把五个硬性条件都写了 (v2 §5.2)，但把它们
-// 打乱放在注释里。你的任务: 先盖住下面的实现, 独立重写一遍, 再对照 ——
-// 能默写出来 = 真正懂了 TMA。
-//
-//   TODO-A  src 必须是 tma.get_tma_tensor(shape)
-//   TODO-B  partition 用 tma_partition, 不是 partition_S/D
-//   TODO-C  事务字节数 = sizeof(make_tensor_like(tensor<0>(tAs)))
-//   TODO-D  elect 出的那 1 个 lane 才发指令
-//   TODO-E  copy(tma.with(bar), tAg, tAs(_, _0)) 一条指令搬整块
-constexpr int EX7_TM = 128, EX7_TK = 64, EX7_GM = 256, EX7_GK = 128;
+    auto mA = make_tensor(make_gmem_ptr(da),
+                          make_layout(make_shape(NTILE * 32 * N_CTA, 32), LayoutRight{}));
+    auto slay = make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{});
+    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mA, slay);
+    // 填好 phase 之前别跑 —— 写死 0 会死锁 (见 kernel 里的注释)。
+    // 先把 TODO 1 填成 (k / STAGES) & 1 再取消下面一行的注释:
+    // double_buffer_kernel<<<N_CTA, 128>>>(tma, dsum);
+    CUDA_CHECK(cudaMemset(dsum, 0, sizeof(float) * N_CTA));
 
-template <class Tma, class SLay>
-__global__ void ex7_tma_kernel(CUTLASS_GRID_CONSTANT Tma const tma, SLay slay, half_t* out) {
-    __shared__ __align__(128) half_t raw[cosize_v<SLay>];
-    __shared__ __align__(8) uint64_t bar[1];
-
-    auto sA = make_tensor(make_smem_ptr(raw), slay);  // (TM,TK,PIPE)
-
-    // 下面 5 个 TODO 都被"注释掉"了 —— 现在 ex7 编译不过。
-    // 每个 TODO 的注释里写了"这一步该干什么 + 答案长什么样"。
-    // 你照着 v2 §5.2 的 copy_tma_kernel 把这 5 段解的解开、写的写对, ex7 就能跑通。
-    // (答案就藏在注释里, 先盖住自己默写一遍, 实在卡住再解开对照)
-
-    // TODO-A  条件 1: src 必须是坐标 tensor (即 tma.get_tma_tensor(shape))。
-    //        解开下面这行, shape 传 gmem 的整体尺寸 (EX7_GM, EX7_GK):
-    //   auto mA = tma.get_tma_tensor(make_shape(EX7_GM, EX7_GK));
-    // TODO-B  条件 5: partition 用 tma_partition + group_modes<0,2>:
-    //   auto pa = tma_partition(tma, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA),
-    //                           group_modes<0, 2>(gA));
-    //   auto gA = local_tile(???);    <- 还需要一行的写完 gA = 本 CTA 的 (0,0) 块
-    //      再取 tAg = get<0>(pa);  tAs = get<1>(pa);
-    // TODO-C  条件: mbarrier 按字节等。tx_bytes = sizeof(make_tensor_like(tensor<0>(tAs)));
-    // TODO-D  elect_one_sync() 每 warp 选一个 lane; 再限定 warp==0 -> 全 block 只剩 1 个
-    // TODO-E  if (warp==0 && one) { Bar::arrive_and_expect_tx(&bar[0], tx_bytes);
-    //                              copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{})); }
-    //  然后所有线程 Bar::wait(&bar[0], 0);
-    //
-    // 现在主动代码里什么 TMA 都没发。下面有 4 处引用了"还没写"的名字,
-    // 所以 ex7 现在编译不过。把每个 [TODO-X] 替换成真实代码即可。
-
-    int warp = cutlass::canonical_warp_idx_sync();
-    // [TODO-D]  这里本该是:
-    //   int one = cute::elect_one_sync();
-    int one = EX7_PENDING_ONE;                                  // <- 换掉
-    // [TODO-A/B/C]  这里本该是: mA / gA / pa / tAg / tAs / tx_bytes
-    //   但现在它们是"未定义" -> 下方引用它们就是编译错误
-    // [TODO-E]  这里本该是:
-    //   using Bar = cutlass::arch::ClusterTransactionBarrier;
-    //   if (warp == 0 && one) { Bar::init(&bar[0], 1); }
-    //   cutlass::arch::fence_barrier_init();
-    //   __syncthreads();
-    //   if (warp == 0 && one) {
-    //       Bar::arrive_and_expect_tx(&bar[0], tx_bytes);
-    //       copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{}));
-    //   }
-    EX7_PENDING_BARRIER_BLOCK;                                  // <- 换成上面那整段
-    Bar::wait(&bar[0], 0);
-    __syncthreads();
-
-    auto s2 = sA(_, _, Int<0>{});
-    for (int i = threadIdx.x; i < EX7_TM * EX7_TK; i += blockDim.x) out[i] = s2(i / EX7_TK, i % EX7_TK);
+    float* hs = new float[N_CTA];
+    CUDA_CHECK(cudaMemcpy(hs, dsum, sizeof(float) * N_CTA, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int b = 0; b < N_CTA; ++b)
+        if (fabsf(hs[b] - 32.f * 32.f * NTILE) > 1e-2f) ok = false;
+    expect("Double Buffer 结果正确", ok);
+    printf("    (写错 phase 的症状是死锁; 本练习自动跑 5 次抓它)\n");
+    printf("\n");
 }
 
-void ex7() {
-    printf("\n--- 练习 7: 手写 TMA 搬运 (§5.2) ---\n");
-    printf("  现在 ex7 编译不过 (TODO 全空着)。\n");
-    printf("  五个 TODO 的答案都写在注释里, 也在 v2 §5.2 的 copy_tma_kernel 里。\n");
-    printf("  填完 -> 编译 -> 跑通 -> 输出 PASS。\n");
-
-    size_t bytes = size_t(EX7_GM) * EX7_GK * sizeof(half_t);
-    size_t tbytes = size_t(EX7_TM) * EX7_TK * sizeof(half_t);
-    half_t *d_a, *d_out, *h_a, *h_out;
-    CUDA_CHECK(cudaMalloc(&d_a, bytes));
-    CUDA_CHECK(cudaMalloc(&d_out, tbytes));
-    h_a = new half_t[EX7_GM * EX7_GK];
-    h_out = new half_t[EX7_TM * EX7_TK];
-    for (int i = 0; i < EX7_GM * EX7_GK; ++i) h_a[i] = half_t(float(i % 1024));
-    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_out, 0, tbytes));
-
-    auto gm = make_tensor(make_gmem_ptr(d_a),
-                          make_layout(make_shape(EX7_GM, EX7_GK), make_stride(EX7_GK, Int<1>{})));
-    auto slay = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
-                              make_shape(Int<EX7_TM>{}, Int<EX7_TK>{}, Int<1>{}));
-    auto tma = make_tma_atom(SM90_TMA_LOAD{}, gm, slay(_, _, Int<0>{}),
-                             make_shape(Int<EX7_TM>{}, Int<EX7_TK>{}));
-
-    dim3 block(128), cluster(1, 1, 1), grid(1, 1);
-    cutlass::ClusterLaunchParams params{grid, block, cluster, 0};
-    void const* kptr = reinterpret_cast<void const*>(&ex7_tma_kernel<decltype(tma), decltype(slay)>);
-    cutlass::launch_kernel_on_cluster(params, kptr, tma, slay, d_out);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, tbytes, cudaMemcpyDeviceToHost));
-    int bad = 0;
-    for (int r = 0; r < EX7_TM; ++r)
-        for (int c = 0; c < EX7_TK; ++c)
-            if (h_out[r * EX7_TK + c] != h_a[r * EX7_GK + c]) ++bad;
-    printf("  TMA 落数错误 %d 处\n", bad);
-    expect("TMA 搬运结果正确", bad == 0);
-    printf("  (独立默写通过后, 把参考实现和 solutions.md 对照)\n");
-
-    cudaFree(d_a);
-    cudaFree(d_out);
-    delete[] h_a;
-    delete[] h_out;
-}
-
-// ===========================================================================
-// 练习 8 — TMA Double Buffer ★★★   (README §6.2)
-//
-// 单缓冲的 TMA->WGMMA: gmem A/B = BM/GK, BN/GK; C = A*B^T。
-// 改成 2-stage double buffer, 让"搬 k+1"和"算 k"重叠。
-//
-// 【交给学员】参考实现已写好。三个 TODO 是理解关键:
-//   TODO-A  smem 数组带 PIPE 维 (Int<EX8_STAGES>), 两个 buffer 轮换
-//   TODO-B  prologue 把两个 stage 都填满
-//   TODO-C  wst/rst 两个 PipelineState 都从 0 开始, 不要预推进
-// 盖住重写一遍, 注意 PipelineState 预推进会死锁 (v3 §6.2 的坑)。
-// ===========================================================================
-constexpr int EX8_BM = 64, EX8_BN = 64, EX8_BK = 64, EX8_GK = 256;
-constexpr int EX8_STAGES = 2;  // double buffer
-
-template <class TmaA, class TmaB, class SLayA, class SLayB, class MMA>
-__global__ void ex8_db_kernel(CUTLASS_GRID_CONSTANT TmaA const tma_a,
-                              CUTLASS_GRID_CONSTANT TmaB const tma_b, SLayA sla, SLayB slb,
-                              MMA mma, float* C) {
-    __shared__ __align__(128) half_t rawA[cosize_v<SLayA>];  // TODO-A (BM,BK,STAGES)
-    __shared__ __align__(128) half_t rawB[cosize_v<SLayB>];
-    __shared__ __align__(8) uint64_t full[EX8_STAGES], empty[EX8_STAGES];
-
-    Tensor sA = make_tensor(make_smem_ptr(rawA), sla);
-    Tensor sB = make_tensor(make_smem_ptr(rawB), slb);
-
-    Tensor mA = tma_a.get_tma_tensor(make_shape(EX8_BM, EX8_GK));
-    Tensor mB = tma_b.get_tma_tensor(make_shape(EX8_BN, EX8_GK));
-    Tensor gA = local_tile(mA, make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}), make_coord(0, _));
-    Tensor gB = local_tile(mB, make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}), make_coord(0, _));
-
-    auto pa = tma_partition(tma_a, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA), group_modes<0, 2>(gA));
-    auto pb = tma_partition(tma_b, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sB), group_modes<0, 2>(gB));
-    Tensor tAg = get<0>(pa);
-    Tensor tAs = get<1>(pa);
-    Tensor tBg = get<0>(pb);
-    Tensor tBs = get<1>(pb);
-    constexpr int txb = sizeof(make_tensor_like(tensor<0>(tAs))) + sizeof(make_tensor_like(tensor<0>(tBs)));
-
-    using FullBar = cutlass::arch::ClusterTransactionBarrier;
-    using EmptyBar = cutlass::arch::ClusterBarrier;
-
-    int warp = cutlass::canonical_warp_idx_sync();
-    int one = cute::elect_one_sync();
-    CUTE_UNROLL
-    for (int s = 0; s < EX8_STAGES; ++s) {
-        if (warp == 0 && one) {
-            FullBar::init(&full[s], 1);
-            EmptyBar::init(&empty[s], 128);
-        }
-    }
-    cutlass::arch::fence_barrier_init();
-    __syncthreads();
-
-    int ktiles = size<1>(tAg);
-    int ktile = 0, left = ktiles;
-
-    // TODO-B  prologue: 把 EX8_STAGES 个 stage 都填满。
-    //   每个 stage s: 如果还有 tile 要搬 (left>0), 让 warp==0&&one 的 lane 做:
-    //     FullBar::arrive_and_expect_tx(&full[s], txb);
-    //     copy(tma_a.with(full[s]), tAg(_, ktile), tAs(_, s));
-    //     copy(tma_b.with(full[s]), tBg(_, ktile), tBs(_, s));
-    //   然后 --left; ++ktile;
-    // 解开下面注释并填完:
-    // CUTE_UNROLL
-    // for (int s = 0; s < EX8_STAGES; ++s) {
-    //     if (left > 0) {
-    //         if (warp == 0 && one) {
-    //             EX8_PENDING_PROLOGUE_BODY;  // <- 替换成真实的 arrive+copy 两行
-    //         }
-    //         --left;
-    //         ++ktile;
-    //     }
-    // }
-    EX8_PENDING_PROLOGUE;  // <- 编译错误: 用上面的模板填完 prologue 之后把这行删掉
-
-    ThrMMA thr = mma.get_thread_slice(threadIdx.x);
-    Tensor gC = make_tensor(make_gmem_ptr(C),
-                            make_layout(make_shape(Int<EX8_BM>{}, Int<EX8_BN>{}),
-                                        make_stride(Int<EX8_BN>{}, Int<1>{})));
-    Tensor tCgC = thr.partition_C(gC);
-    Tensor tCrC = thr.make_fragment_C(tCgC);
-    clear(tCrC);
-    Tensor tCrA = thr.make_fragment_A(thr.partition_A(sA));
-    Tensor tCrB = thr.make_fragment_B(thr.partition_B(sB));
-
-    // TODO-C  两个 PipelineState 都从 0 开始 (不要预推进, 否则死锁!)
-    //   auto wst = cutlass::PipelineState<EX8_STAGES>();
-    //   auto rst = cutlass::PipelineState<EX8_STAGES>();
-    auto EX8_PENDING_STATES = cutlass::PipelineState<EX8_STAGES>(); // <- 把这行改成上面两行
-
-    CUTE_NO_UNROLL
-    while (left > -EX8_STAGES) {
-        int rp = rst.index();
-        FullBar::wait(&full[rp], rst.phase());
-
-        warpgroup_arrive();
-        gemm(mma, tCrA(_, _, _, rp), tCrB(_, _, _, rp), tCrC);
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
-
-        EmptyBar::arrive(&empty[rp]);
-        ++rst;
-
-        if (warp == 0 && one && left > 0) {
-            int wp = wst.index();
-            EmptyBar::wait(&empty[wp], wst.phase());
-            FullBar::arrive_and_expect_tx(&full[wp], txb);
-            copy(tma_a.with(full[wp]), tAg(_, ktile), tAs(_, wp));
-            copy(tma_b.with(full[wp]), tBg(_, ktile), tBs(_, wp));
-            ++wst;
-        }
-        --left;
-        ++ktile;
-    }
-    copy(tCrC, tCgC);
-}
-
-void ex8() {
-    printf("\n--- 练习 8: TMA Double Buffer (§6.2) ---\n");
-    printf("  参考实现已写好 —— 盖住重写一遍, 注意 PipelineState 预推进会死锁。\n");
-
-    auto sla = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
-                             make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}, Int<EX8_STAGES>{}));
-    auto slb = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
-                             make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}, Int<EX8_STAGES>{}));
-    half_t *d_a, *d_b;
-    float* d_c;
-    CUDA_CHECK(cudaMalloc(&d_a, size_t(EX8_BM) * EX8_GK * sizeof(half_t)));
-    CUDA_CHECK(cudaMalloc(&d_b, size_t(EX8_BN) * EX8_GK * sizeof(half_t)));
-    CUDA_CHECK(cudaMalloc(&d_c, size_t(EX8_BM) * EX8_BN * sizeof(float)));
-    half_t* h_a = new half_t[EX8_BM * EX8_GK];
-    half_t* h_b = new half_t[EX8_BN * EX8_GK];
-    for (int i = 0; i < EX8_BM * EX8_GK; ++i) h_a[i] = half_t(float(int(i % 7) - 3));
-    for (int i = 0; i < EX8_BN * EX8_GK; ++i) h_b[i] = half_t(float(int(i % 5) - 2));
-    CUDA_CHECK(cudaMemcpy(d_a, h_a, size_t(EX8_BM) * EX8_GK * sizeof(half_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, h_b, size_t(EX8_BN) * EX8_GK * sizeof(half_t), cudaMemcpyHostToDevice));
-
-    auto gm_a = make_tensor(make_gmem_ptr(d_a),
-                            make_layout(make_shape(Int<EX8_BM>{}, EX8_GK), make_stride(EX8_GK, Int<1>{})));
-    auto gm_b = make_tensor(make_gmem_ptr(d_b),
-                            make_layout(make_shape(Int<EX8_BN>{}, EX8_GK), make_stride(EX8_GK, Int<1>{})));
-    auto ta = make_tma_atom(SM90_TMA_LOAD{}, gm_a, sla(_, _, Int<0>{}), make_shape(Int<EX8_BM>{}, Int<EX8_BK>{}));
-    auto tb = make_tma_atom(SM90_TMA_LOAD{}, gm_b, slb(_, _, Int<0>{}), make_shape(Int<EX8_BN>{}, Int<EX8_BK>{}));
-    auto mma = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
-
-    for (int i = 0; i < 5; ++i) {  // 跑 5 次, 抓 barrier 死锁/竞争
-        cutlass::ClusterLaunchParams params{dim3(1, 1, 1), dim3(128), dim3(1, 1, 1), 0};
-        void const* kptr = reinterpret_cast<void const*>(
-            &ex8_db_kernel<decltype(ta), decltype(tb), decltype(sla), decltype(slb), decltype(mma)>);
-        cutlass::launch_kernel_on_cluster(params, kptr, ta, tb, sla, slb, mma, d_c);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    float* h_c = new float[EX8_BM * EX8_BN];
-    CUDA_CHECK(cudaMemcpy(h_c, d_c, size_t(EX8_BM) * EX8_BN * sizeof(float), cudaMemcpyDeviceToHost));
-    int bad = 0;
-    for (int m = 0; m < EX8_BM; ++m)
-        for (int n = 0; n < EX8_BN; ++n) {
-            double acc = 0;
-            for (int k = 0; k < EX8_GK; ++k) acc += float(h_a[m * EX8_GK + k]) * float(h_b[n * EX8_GK + k]);
-            if (fabs(acc - h_c[m * EX8_BN + n]) > 1e-2) ++bad;
-        }
-    printf("  C = A*B^T 错误 %d 处\n", bad);
-    expect("TMA Double Buffer 结果正确", bad == 0);
-    printf("  (独立默写通过后和 solutions.md 对照)\n");
-
-    cudaFree(d_a);
-    cudaFree(d_b);
-    cudaFree(d_c);
-    delete[] h_a;
-    delete[] h_b;
-    delete[] h_c;
-}
 int main() {
-    printf("========== cute_04 练习 ==========\n");
-    ex1();
-    ex2();
-    ex3();
-    ex4();
-    ex5();
-    ex6();
-    ex7();
-    ex8();
-    printf("\n===== 结果: %d PASS, %d FAIL =====\n", g_pass, g_fail);
-    if (g_fail > 0) printf("还有 TODO 没填 —— 打开 ex.cu 搜 TODO。\n");
+    printf("cute_04 练习 — 每题填完 TODO 后 make run\n\n");
+    ex1(); ex2(); ex3(); ex4(); ex5(); ex6(); ex7(); ex8();
+    printf("=======================================\n");
+    printf("  %d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

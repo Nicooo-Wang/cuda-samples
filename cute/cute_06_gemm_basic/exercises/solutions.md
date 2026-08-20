@@ -91,7 +91,7 @@ Bar::wait(&bar[0], 0);
 
 - `arrive_and_expect_tx(bar, txb)` **必须在 copy 前**：mbarrier 需要知道这一轮
   等多少字节（`txb = A 字节 + B 字节`）。
-- 单次 TMA phase 恒 0。多 stage 的 phase 翻转（`k & 1`）是 cute_04 §6 / v3 的事。
+- 单次 TMA phase 恒 0。多 stage 的 phase 翻转（`(k/STAGES) & 1`）是 cute_04 §5 的事。
 
 ---
 

@@ -1,30 +1,33 @@
-// cute_04 v2 —— TMA: 把搬运交给硬件
+// cute_04 v2 —— TMA store 与边界: 把搬回去那一步也交给硬件
 //
-// 对应 README §5。
+// 对应 README §3。
 //
-// v1 结束时, gmem->smem 已经是 CuTe 的 copy() 了, 但底下仍然是
-// "256 个线程各自算地址、各自发一条 load"。SM90 提供了另一条路: TMA。
+// v1 只换了 gmem->smem。搬回 gmem 那一步还是 v0 的手写循环。这一版把它也
+// 换成 TMA, 于是整条通路两端都是硬件搬运。
 //
-// 这个文件按"先看旧写法, 再看新写法"的顺序排:
+//   §3.1  TMA store: smem -> gmem          <- 和 load 反过来, 同步机制也不同
+//   §3.2  两端都用 TMA: 完整的一趟          <- load + store 串起来
+//   §3.3  边界: tile 不整除时硬件自己兜      <- v0 要写 predicate, TMA 不用
 //
-//   §5.1  cp.async 手写搬运      <- 没有 TMA 时怎么搬 (对照基准)
-//   §5.2  TMA 搬同一块 tile      <- 有了 TMA 怎么搬
-//   §5.3  TMA 的四种 swizzle 模式 <- SW128 / SW64 / SW32 / INTER 怎么选
-//   §5.4  WGMMA 才挑 layout      <- TMA 不挑, 消费者挑
+// ---------------------------------------------------------------------------
+// load 和 store 最重要的区别: 同步方向反了
 //
-// 每一节都是「一个 kernel + 紧跟其后的一个 host 函数」, 自带缓冲区和验证。
+//   TMA load    gmem -> smem    数据是**搬完之后**才能用   -> 事后等: mbarrier
+//   TMA store   smem -> gmem    数据要**搬之前**就写好     -> 事前挡: fence
+//
+//   load :   发起 --------> [硬件搬] --------> wait_barrier --> 读 smem
+//                                                ^^^^^^^^ 等它搬完
+//
+//   store:   写 smem --> fence --> 发起 --------> [硬件搬] --> (可选 wait)
+//                        ^^^^^ 保证前面的写对硬件可见
+//
+// 这就是为什么 store 那段代码里看不到 mbarrier。
 //
 // ---------------------------------------------------------------------------
 //
 // 多卡机器上请指定一张空闲卡:  CUDA_VISIBLE_DEVICES=<idle> ./cute_tiled_v2
 
 #include <cute/tensor.hpp>
-#include <cute/atom/copy_atom.hpp>
-#include <cute/atom/mma_atom.hpp>
-#include <cute/arch/copy_sm90_tma.hpp>
-#include <cutlass/arch/barrier.h>
-#include <cutlass/cluster_launch.hpp>
-#include <cutlass/device_kernel.h>
 #include <cstdio>
 
 #include "common.h"
@@ -32,469 +35,323 @@
 using namespace cute;
 
 // ---------------------------------------------------------------------------
-// 全文件统一的尺寸
-//
-//   gmem 里的 A:  GM x GK 个 half, row-major, stride = (GK, 1)
-//                 256 x 128 half = 64KB
-//
-//   一个 CTA 搬走其中一块 tile:  TM x TK = 128 x 64 half = 16KB
-//                 tile 在 gmem 里不是连续的 —— 每行取 TK 个, 跨 GK 到下一行
-//
-//   +---------------- GK = 128 ----------------+
-//   | <--- TK = 64 --->                        |  ^
-//   | +---------------+                        |  |
-//   | |   本 CTA 要   |                        |  | TM = 128
-//   | |   搬的 tile   |                        |  |
-//   | +---------------+                        |  v
-//   |                                          |     ^
-//   |                                          |     | GM = 256
-//   +------------------------------------------+     v
+// 和 v0/v1 相同的尺寸 (§3.3 会另用一组不整除的尺寸)
 // ---------------------------------------------------------------------------
-constexpr int GM = 256, GK = 128;  // 整个 A 矩阵
-constexpr int TM = 128, TK = 64;   // 一个 CTA 搬的 tile
-constexpr int NTHR = 128;          // 每 CTA 线程数 (一个 warpgroup)
+constexpr int M = 256, N = 128;
+constexpr int CM = 32, CN = 32;
+constexpr int NTHR = 128;
 
-// ---------------------------------------------------------------------------
-// §5.1 / §5.2 共用的缓冲区
-//
-// h_a 填 i % 1024: fp16 整数只精确到 2048, 填 i 会在大下标失精度导致误报
-// ---------------------------------------------------------------------------
+static dim3 grid() { return dim3(M / CM, N / CN); }
+
 struct Buffers {
-    static constexpr size_t a_elems = size_t(GM) * GK;
-    static constexpr size_t t_elems = size_t(TM) * TK;
+    static constexpr size_t elems = size_t(M) * N;
+    static constexpr size_t bytes = elems * sizeof(float);
 
-    half_t* d_a;    // gmem 里的 A
-    half_t* d_out;  // kernel 把 smem 原样倒出来, 供 host 比对
-    half_t* h_a;
-    half_t* h_out;
+    float* d_in;
+    float* d_out;
+    float* h_in;
+    float* h_out;
 
     Buffers() {
-        CUDA_CHECK(cudaMalloc(&d_a, a_elems * sizeof(half_t)));
-        CUDA_CHECK(cudaMalloc(&d_out, t_elems * sizeof(half_t)));
-        h_a = new half_t[a_elems];
-        h_out = new half_t[t_elems];
-        for (size_t i = 0; i < a_elems; ++i) h_a[i] = half_t(float(i % 1024));
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, a_elems * sizeof(half_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(d_out, 0, t_elems * sizeof(half_t)));
+        CUDA_CHECK(cudaMalloc(&d_in, bytes));
+        CUDA_CHECK(cudaMalloc(&d_out, bytes));
+        h_in = new float[elems];
+        h_out = new float[elems];
+        for (size_t i = 0; i < elems; ++i) h_in[i] = float(i);
+        CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_out, 0, bytes));
     }
 
     ~Buffers() {
-        CUDA_CHECK(cudaFree(d_a));
+        CUDA_CHECK(cudaFree(d_in));
         CUDA_CHECK(cudaFree(d_out));
-        delete[] h_a;
+        delete[] h_in;
         delete[] h_out;
     }
 
-    // tile (0,0) 落数是否正确: smem 的 (r,c) 应该等于 A 的 (r,c)
     bool check() {
-        CUDA_CHECK(cudaMemcpy(h_out, d_out, t_elems * sizeof(half_t), cudaMemcpyDeviceToHost));
-        for (int r = 0; r < TM; ++r)
-            for (int c = 0; c < TK; ++c)
-                if (float(h_out[r * TK + c]) != float(h_a[r * GK + c])) return false;
+        CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < elems; ++i)
+            if (h_out[i] != h_in[i]) return false;
         return true;
     }
 };
 
-// half 的 bank: 一个 bank 4 字节 = 2 个 half, 所以偏移 x2 变字节
-template <class Lay>
-static int col_conflict_half(Lay lay, int lanes = 32) {
-    return max_bank_requests(lanes, [&](int l) { return int(lay(l, 0)) * 2; });
-}
-
 // ===========================================================================
-// §5.1  没有 TMA 时怎么搬: cp.async, 每个线程算自己的地址
+// §3.1  TMA store: smem -> gmem
 //
-// 这就是 v1 的写法搬到 half + 更大 tile 上。要点:
-//   - 128 个线程每人负责 tile 的一部分, 各自算地址、各自发一条 cp.async
-//   - 同步用 cp_async_wait + __syncthreads (全 block 栅栏)
-//   - tile 边界要靠 predicate 兜 (这里 tile 整除, 所以省了)
+// 为了把 store 单独看清楚, 这个 kernel 不做 load —— 直接在 smem 里造数据,
+// 然后 TMA store 出去。三个新东西:
+//
+//   tma_store_fence()     保证前面对 smem 的普通写, 对 TMA 硬件可见
+//   copy(tma, S, D)       注意没有 .with(bar) —— store 不用 barrier
+//   tma_store_arrive/wait 提交 + 等待 (只在还要复用 smem 时才需要)
+//
+// 方向也反了: partition_S 作用在 smem 上, partition_D 作用在 gmem 坐标上。
 // ===========================================================================
-template <class SLay, class TC>
-__global__ static void copy_cpasync_kernel(const half_t* __restrict__ a, half_t* __restrict__ out,
-                                           SLay slay, TC tc) {
-    __shared__ __align__(128) half_t raw[cosize_v<SLay>];
-    auto sA = make_tensor(make_smem_ptr(raw), slay);
+template <class TmaStore>
+__global__ static void store_only_kernel(__grid_constant__ const TmaStore tma) {
+    __shared__ __align__(128) float smem[CM * CN];
 
-    // gmem 视图 + 取出本 CTA 的 tile (0,0)
-    auto mA = make_tensor(make_gmem_ptr(a),
-                          make_layout(make_shape(Int<GM>{}, Int<GK>{}),
-                                      make_stride(Int<GK>{}, Int<1>{})));
-    auto gA = local_tile(mA, Shape<Int<TM>, Int<TK>>{}, make_coord(0, 0));
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto sT = make_tensor(make_smem_ptr(smem), slay);
 
-    // 128 个线程分工: 每人搬 TM*TK/128 = 64 个 half
-    auto thr = tc.get_slice(threadIdx.x);
-    copy(tc, thr.partition_S(gA), thr.partition_D(sA));
+    // 在 smem 里造出"这个位置在全局矩阵里的线性下标"
+    const int row0 = blockIdx.x * CM, col0 = blockIdx.y * CN;
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x)
+        sT(i / CN, i % CN) = float((row0 + i / CN) * N + (col0 + i % CN));
 
-    // cp.async 是异步的, 要等它落地; 然后还要 __syncthreads 让全 block 都看到
-    cp_async_fence();
-    cp_async_wait<0>();
-    __syncthreads();
+    __syncthreads();     // 1) 等全 CTA 写完 smem (普通的线程间同步)
+    tma_store_fence();   // 2) 再保证这些写对 TMA 硬件 (异步 proxy) 可见
+                         //    少了这一行是**竞态**: 可能搬出去半新半旧的数据
 
-    // 倒出来给 host 比对
-    for (int i = threadIdx.x; i < TM * TK; i += blockDim.x) out[i] = sA(i / TK, i % TK);
+    if (threadIdx.x == 0) {
+        auto gcoord = tma.get_tma_tensor(make_shape(Int<M>{}, Int<N>{}));
+        auto gtile =
+            local_tile(gcoord, Shape<Int<CM>, Int<CN>>{}, make_coord(blockIdx.x, blockIdx.y));
+        auto per_cta = tma.get_slice(0);
+
+        // 注意两点: 没有 .with(bar); partition_S 是 smem, partition_D 是 gmem
+        copy(tma, per_cta.partition_S(sT), per_cta.partition_D(gtile));
+        tma_store_arrive();  // 提交这一批 store
+    }
+    tma_store_wait<0>();  // 等到 0 个未完成 —— 本 kernel 之后不再用 smem,
+                          // 其实可以省; 但要复用 smem 就必须有 (v3 会用到)
 }
 
-static void section51_cpasync() {
-    print_separator("§5.1  没有 TMA: cp.async, 每线程算自己的地址");
-
-    printf("  gmem A = %dx%d half, row-major, stride = (%d,1)\n", GM, GK, GK);
-    printf("  本 CTA 搬 tile (0,0) = %dx%d half = %d KB, 用 %d 个线程\n\n", TM, TK,
-           TM * TK * 2 / 1024, NTHR);
-
-    // smem 用 GMMA 的 SW128 原子铺开 —— 和 §5.2 完全一样, 便于对照
-    auto slay = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
-                              make_shape(Int<TM>{}, Int<TK>{}));
-
-    // 128-bit atom: 每线程一次 8 个 half; 线程排成 (16,8), 每人 (1,8)
-    auto tc = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
-                              make_layout(make_shape(Int<16>{}, Int<8>{}),
-                                          make_stride(Int<8>{}, Int<1>{})),
-                              make_layout(make_shape(Int<1>{}, Int<8>{})));
+static void section31_tma_store() {
+    print_separator("§3.1  TMA store: smem -> gmem");
 
     Buffers buf;
-    copy_cpasync_kernel<<<1, NTHR>>>(buf.d_a, buf.d_out, slay, tc);
+
+    // host 侧: 和 load 一模一样的两步, 只是把 SM90_TMA_LOAD 换成 SM90_TMA_STORE
+    auto mOut = make_tensor(make_gmem_ptr(buf.d_out),
+                            make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mOut, slay);
+    //                             ^^^^^^^^^^^^^^ 唯一的区别
+
+    store_only_kernel<<<grid(), NTHR>>>(tma_store);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    printf("    smem layout = ");
-    print(slay);
-    printf("\n    落数 = %s\n", buf.check() ? "正确" : "错误");
+    printf("    kernel 在 smem 里造 out[i] = i, 再 TMA store 出去\n");
+    printf("    结果 = %s\n", buf.check() ? "正确" : "错误");
 
-    printf("\n  这一版的成本清单:\n");
-    printf("    发指令的线程数   128 个 (每人一条 cp.async)\n");
-    printf("    地址计算         每线程各算一次\n");
-    printf("    边界处理         要自己写 predicate (本例整除, 省了)\n");
-    printf("    同步             cp_async_wait + __syncthreads, 全 block 栅栏\n");
-    printf("    寄存器           每线程都要占几个存地址\n");
+    printf("\n  load 和 store 的三点差别:\n\n");
+    printf("                  TMA load                   TMA store\n");
+    printf("    ------------  -------------------------  -------------------------\n");
+    printf("    方向          gmem -> smem               smem -> gmem\n");
+    printf("    同步机制      mbarrier (等字节数)        fence (挡在发起之前)\n");
+    printf("    同步时机      搬完之后等                 发起之前挡\n");
+    printf("    copy 写法     copy(tma.with(bar), S, D)  copy(tma, S, D)\n");
+    printf("    partition_S   gmem 坐标                  smem\n");
+    printf("    partition_D   smem                       gmem 坐标\n");
 }
 
 // ===========================================================================
-// §5.2  有了 TMA: 一个线程描述整块, 硬件自己搬
+// §3.2  两端都用 TMA: 完整的一趟
 //
-// 同一块 tile, 换成 TMA。五个硬性条件都标在代码里:
-//   条件 1  src 必须是 tma.get_tma_tensor(shape) —— 坐标 tensor, 不是数据 tensor
-//   条件 2  descriptor 必须在 host 用真实设备指针构造 (见下面的 host 函数)
-//   条件 3  smem 必须 __align__(128)
-//   条件 4  smem layout 必须带 PIPE 维, 建 atom 时传切片 slay(_,_,Int<0>{})
-//   条件 5  partition 用 tma_partition, 不是 partition_S/D
+// 把 §2.1 的 load 和 §3.1 的 store 串起来。整个 kernel 里:
+//   - 搬运指令一共两条, 都由 thread 0 发
+//   - 其余 127 个线程只负责在中间"读一下 smem" (这里做一个平方, 代表计算)
 // ===========================================================================
-template <class TmaAtom, class SLay>
-__global__ static void copy_tma_kernel(CUTLASS_GRID_CONSTANT TmaAtom const tma, SLay slay,
-                                       half_t* __restrict__ out, bool announce) {
-    __shared__ __align__(128) half_t raw[cosize_v<SLay>];  // 条件 3
-    __shared__ __align__(8) uint64_t bar[1];               // mbarrier, 不是 __syncthreads
+template <class TmaLoad, class TmaStore>
+__global__ static void load_store_kernel(__grid_constant__ const TmaLoad tma_load,
+                                         __grid_constant__ const TmaStore tma_store) {
+    constexpr int tx_bytes = CM * CN * sizeof(float);
+    __shared__ __align__(128) float smem[CM * CN];
+    __shared__ uint64_t bar;
 
-    auto sA = make_tensor(make_smem_ptr(raw), slay);  // (TM,TK,PIPE)   条件 4
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto sT = make_tensor(make_smem_ptr(smem), slay);
+    auto blk = make_coord(blockIdx.x, blockIdx.y);
 
-    // 条件 1: 坐标 tensor。它不存数据, 只提供"我要 gmem 的哪一块"的坐标
-    auto mA = tma.get_tma_tensor(make_shape(Int<GM>{}, Int<GK>{}));
-    auto gA = local_tile(mA, Shape<Int<TM>, Int<TK>>{}, make_coord(0, 0));
-
-    // 条件 5: TMA 专用 partition。group_modes<0,2> 把 (TM,TK,*) 压成 ((TM,TK),*),
-    //         因为 mode-0 整个交给 TMA 负责
-    auto p = tma_partition(tma, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA),
-                           group_modes<0, 2>(gA));
-    auto tAg = get<0>(p);  // (TMA,)      gmem 侧
-    auto tAs = get<1>(p);  // (TMA,PIPE)  smem 侧
-
-    // 这一次搬多少字节 —— mbarrier 要按字节数等
-    constexpr int tx_bytes = sizeof(make_tensor_like(tensor<0>(tAs)));
-
-    int warp = cutlass::canonical_warp_idx_sync();
-    int one = cute::elect_one_sync();  // 从一个 warp 里选出唯一一个 lane
-    using Bar = cutlass::arch::ClusterTransactionBarrier;
-
-    if (warp == 0 && one) Bar::init(&bar[0], 1);
-    cutlass::arch::fence_barrier_init();
+    if (threadIdx.x == 0) initialize_barrier(bar, 1);
     __syncthreads();
 
-    // ---- 整个搬运就这三行, 而且只有一个 lane 在跑 ----
-    if (warp == 0 && one) {
-        Bar::arrive_and_expect_tx(&bar[0], tx_bytes);       // 告诉 barrier 要等多少字节
-        copy(tma.with(bar[0]), tAg, tAs(_, Int<0>{}));      // 一条指令描述整块
+    // ---- load: gmem -> smem ----
+    if (threadIdx.x == 0) {
+        set_barrier_transaction_bytes(bar, tx_bytes);
+        auto gc = tma_load.get_tma_tensor(make_shape(Int<M>{}, Int<N>{}));
+        auto gt = local_tile(gc, Shape<Int<CM>, Int<CN>>{}, blk);
+        auto per = tma_load.get_slice(0);
+        copy(tma_load.with(bar), per.partition_S(gt), per.partition_D(sT));
     }
-    Bar::wait(&bar[0], 0);  // 所有线程在这里等硬件搬完
-    // 注意: 其余 127 个线程从头到尾没参与搬运
+    __syncthreads();
+    wait_barrier(bar, 0);
 
-    if (announce && thread0())
-        printf("    TMA 一次搬 %d 字节 (= %d KB)\n", tx_bytes, tx_bytes / 1024);
+    // ---- 中间的"计算": 全 CTA 参与, 原地平方 ----
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) {
+        float v = sT(i / CN, i % CN);
+        sT(i / CN, i % CN) = v * v;
+    }
 
-    auto s2 = sA(_, _, Int<0>{});
-    for (int i = threadIdx.x; i < TM * TK; i += blockDim.x) out[i] = s2(i / TK, i % TK);
+    // ---- store: smem -> gmem ----
+    __syncthreads();
+    tma_store_fence();
+    if (threadIdx.x == 0) {
+        auto gc = tma_store.get_tma_tensor(make_shape(Int<M>{}, Int<N>{}));
+        auto gt = local_tile(gc, Shape<Int<CM>, Int<CN>>{}, blk);
+        auto per = tma_store.get_slice(0);
+        copy(tma_store, per.partition_S(sT), per.partition_D(gt));
+        tma_store_arrive();
+    }
+    tma_store_wait<0>();
 }
 
-// TMA 版的 host 侧: descriptor 在这里构造 (条件 2)
-template <class SLay3>
-static bool launch_tma_copy(SLay3 slay3, Buffers& buf, bool verbose) {
-    // gmem 视图必须用**真实设备指针**建 —— 用 nullptr 会在运行时报
-    // "Failed to initialize the TMA descriptor 201"
-    auto mA = make_tensor(make_gmem_ptr(buf.d_a),
-                          make_layout(make_shape(Int<GM>{}, Int<GK>{}),
-                                      make_stride(Int<GK>{}, Int<1>{})));
+static void section32_round_trip() {
+    print_separator("§3.2  两端都用 TMA: load -> 计算 -> store");
 
-    // 条件 4: 建 atom 时传 PIPE 的一个切片, 不是整个三维 layout
-    auto tma = make_tma_atom(SM90_TMA_LOAD{}, mA, slay3(_, _, Int<0>{}),
-                             make_shape(Int<TM>{}, Int<TK>{}));
+    Buffers buf;
+    auto mIn = make_tensor(make_gmem_ptr(buf.d_in),
+                           make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
+    auto mOut = make_tensor(make_gmem_ptr(buf.d_out),
+                            make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
 
-    if (verbose) {
-        printf("    TMA atom  = ");
-        print(tma);
-        printf("\n");
-    }
+    // 两个方向各要一个 descriptor —— 不能共用
+    auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, mIn, slay);
+    auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mOut, slay);
 
-    // TMA kernel 要用 cluster launch 启动
-    dim3 block(NTHR), cluster(1, 1, 1), grid(1, 1);
-    cutlass::ClusterLaunchParams params{grid, block, cluster, 0};
-    void const* kptr =
-        reinterpret_cast<void const*>(&copy_tma_kernel<decltype(tma), SLay3>);
-    cutlass::launch_kernel_on_cluster(params, kptr, tma, slay3, buf.d_out, verbose);
+    load_store_kernel<<<grid(), NTHR>>>(tma_load, tma_store);
     CUDA_CHECK(cudaDeviceSynchronize());
-    return buf.check();
-}
 
-static void section52_tma() {
-    print_separator("§5.2  有了 TMA: 一个线程描述整块");
+    CUDA_CHECK(cudaMemcpy(buf.h_out, buf.d_out, Buffers::bytes, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (size_t i = 0; i < Buffers::elems; ++i)
+        if (buf.h_out[i] != buf.h_in[i] * buf.h_in[i]) ok = false;
 
-    printf("  搬的是和 §5.1 完全相同的 tile。\n\n");
+    printf("    out = in^2 的结果 = %s\n", ok ? "正确" : "错误");
 
-    // 条件 4: 必须带 PIPE 维。这里 PIPE=1, 到 v3 做多 stage 时它会变成 2/3/4
-    auto slay3 = tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{},
-                               make_shape(Int<TM>{}, Int<TK>{}, Int<1>{}));
+    printf("\n  这个 kernel 里搬运指令一共两条, 都由 thread 0 发。\n");
+    printf("  但**不是说其他 127 个线程闲着** —— 中间那段平方是全 CTA 一起做的。\n");
+    printf("  TMA 省掉的是\"算地址、发搬运指令\"这件事, 不是省掉线程。\n");
 
-    Buffers buf;
-    bool ok = launch_tma_copy(slay3, buf, true);
-    printf("    smem layout = ");
-    print(slay3);
-    printf("\n    落数 = %s\n", ok ? "正确" : "错误");
-
-    printf("\n  和 §5.1 并排看:\n\n");
-    printf("                  cp.async (§5.1)              TMA (§5.2)\n");
-    printf("    ------------  ---------------------------  --------------------------\n");
-    printf("    发指令线程    128 个, 每人一条             1 个 lane, 一共一条\n");
-    printf("    地址计算      每线程各算一次               host 侧 descriptor 算好\n");
-    printf("    边界处理      自己写 predicate             硬件自动填 0\n");
-    printf("    同步          cp_async_wait+syncthreads    mbarrier 按字节数等\n");
-    printf("    寄存器占用    每线程存地址                 几乎为 0\n");
-    printf("    swizzle       由 smem layout 决定          写进 descriptor\n");
-
-    printf("\n  descriptor 里存了什么 (host 侧那 128 字节):\n");
-    printf("      gmem 基地址\n");
-    printf("      gmem 形状 (%d, %d), stride (%d, 1)\n", GM, GK, GK);
-    printf("      tile 形状 (%d, %d)\n", TM, TK);
-    printf("      smem 的 swizzle 模式      <- 就是 §5.3 要讲的那四种\n");
-    printf("      元素类型 / 越界填充策略\n");
-    printf("    kernel 里只说\"搬第 (0,0) 块\", 其余全在 descriptor 里。\n");
+    printf("\n  两个方向各要一个 descriptor:\n");
+    printf("    make_tma_copy(SM90_TMA_LOAD{},  mIn,  slay)\n");
+    printf("    make_tma_copy(SM90_TMA_STORE{}, mOut, slay)\n");
+    printf("  一个 descriptor 绑死一个 gmem 张量 + 一个方向, 不能共用。\n");
 }
 
 // ===========================================================================
-// §5.3  TMA 的四种 swizzle 模式
+// §3.3  边界: tile 不整除时, 硬件自己兜
 //
-// descriptor 里的 swizzle 字段只有几个取值。CuTe 把它们封成四个 layout 原子,
-// 名字里的数字是"一行占多少字节":
+// 前面的尺寸都是整除的。真实矩阵不会这么配合。
+// v0 那种手写搬运碰到不整除, 必须自己写 predicate:
 //
-//   SW128  一行 128 字节 = 64 个 half
-//   SW64   一行  64 字节 = 32 个 half
-//   SW32   一行  32 字节 = 16 个 half
-//   INTER  一行  16 字节 =  8 个 half   (Sw<0>, 即不 swizzle)
+//     if (row0 + r < M && col0 + c < N) smem[...] = in[...];
+//     else                              smem[...] = 0;
 //
-// 这一节用同一个 §5.2 的 kernel 跑四种模式, 看它们的差别。
+// TMA 不用写。硬件读到越界坐标就跳过, smem 里对应位置填 0。
+// 这里用 M=40, N=36, tile 32x32 —— 右下角那个 CTA 只有 8x4 是有效的。
 // ===========================================================================
-template <class Atom>
-static void try_swizzle_mode(const char* name, Atom atom, int row_bytes) {
-    auto slay3 = tile_to_shape(atom, make_shape(Int<TM>{}, Int<TK>{}, Int<1>{}));
-    Buffers buf;
-    bool ok = launch_tma_copy(slay3, buf, false);
-    auto s2 = slay3(_, _, Int<0>{});
-    printf("    %-7s 一行 %3d 字节   落数 %-4s   consumer 列读 = %2d-way   cosize = %d\n", name,
-           row_bytes, ok ? "正确" : "错误", col_conflict_half(s2), int(cosize(s2)));
-}
+constexpr int OM = 40, ON = 36;  // 故意不被 32 整除
 
-static void section53_swizzle_modes() {
-    print_separator("§5.3  TMA 的四种 swizzle 模式");
+template <class TmaLoad>
+__global__ static void oob_kernel(__grid_constant__ const TmaLoad tma, float* __restrict__ dump,
+                                  int gridN) {
+    constexpr int tx_bytes = CM * CN * sizeof(float);
+    __shared__ __align__(128) float smem[CM * CN];
+    __shared__ uint64_t bar;
 
-    printf("  四个原子的实际参数 (Sw<B,M,S> o (行,列):(stride)):\n");
-    printf("    SW128 = ");
-    print(GMMA::Layout_K_SW128_Atom<half_t>{});
-    printf("\n    SW64  = ");
-    print(GMMA::Layout_K_SW64_Atom<half_t>{});
-    printf("\n    SW32  = ");
-    print(GMMA::Layout_K_SW32_Atom<half_t>{});
-    printf("\n    INTER = ");
-    print(GMMA::Layout_K_INTER_Atom<half_t>{});
-    printf("\n\n");
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto sT = make_tensor(make_smem_ptr(smem), slay);
 
-    printf("  同一个 TMA kernel, 只换 smem layout 原子 (tile %dx%d half):\n", TM, TK);
-    try_swizzle_mode("SW128", GMMA::Layout_K_SW128_Atom<half_t>{}, 128);
-    try_swizzle_mode("SW64", GMMA::Layout_K_SW64_Atom<half_t>{}, 64);
-    try_swizzle_mode("SW32", GMMA::Layout_K_SW32_Atom<half_t>{}, 32);
-    try_swizzle_mode("INTER", GMMA::Layout_K_INTER_Atom<half_t>{}, 16);
-
-    printf("\n  两点结论:\n");
-    printf("    1) 四种模式 TMA 都搬得对 —— 选哪个不影响正确性, 只影响\n");
-    printf("       consumer 读 smem 时撞几路 bank。\n");
-    printf("    2) 四个原子的 M 全 = 4 (2^4 = 16 个 half = 32 字节)。这正是\n");
-    printf("       §3.4 那条规则的体现: 先保住向量宽度, 再消冲突。\n");
-
-    printf("\n  怎么选: 唯一的硬约束是 TK 必须被原子的 K 长度整除。\n");
-    printf("    TK (half) | SW128(64) | SW64(32) | SW32(16) | INTER(8)\n");
-    printf("       64     |    可     |    可    |    可    |   可\n");
-    printf("       32     |   不可    |    可    |    可    |   可\n");
-    printf("       16     |   不可    |   不可   |    可    |   可\n");
-    printf("  违反了会编译期报:\n");
-    printf("    \"tile_to_shape: block shape does not divide the target shape\"\n");
-    printf("\n  实用规则: 选能用的里面一行字节数最大的 (对齐最大 = 访存最宽)。\n");
-    printf("  本例 TK=%d -> 选 SW128。\n", TK);
-}
-
-// ===========================================================================
-// §5.4  谁挑 layout: TMA 不挑, WGMMA 挑
-//
-// §5.3 已经看到 TMA 对四种官方模式都能搬。那 plain row-major 行不行?
-// 行 —— TMA 照样搬得对。真正拒绝它的是下游的 WGMMA, 而且是编译期拒绝。
-// ===========================================================================
-constexpr int BM = 64, BN = 64, BK = 64;
-
-template <class MMA, class SLayA, class SLayB>
-__global__ static void wgmma_kernel(const half_t* A, const half_t* B, float* C, MMA mma,
-                                    SLayA sla, SLayB slb) {
-    __shared__ __align__(128) half_t rawA[cosize_v<SLayA>];
-    __shared__ __align__(128) half_t rawB[cosize_v<SLayB>];
-
-    auto sA = make_tensor(make_smem_ptr(rawA), sla);
-    auto sB = make_tensor(make_smem_ptr(rawB), slb);
-
-    // 朴素装载 (不是本节重点, 只为把数据摆进 smem)
-    for (int i = threadIdx.x; i < BM * BK; i += blockDim.x) sA(i / BK, i % BK) = A[i];
-    for (int i = threadIdx.x; i < BN * BK; i += blockDim.x) sB(i / BK, i % BK) = B[i];
+    // 先把 smem 污染成 -1, 好看清楚哪些位置是硬件真写过的
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) smem[i] = -1.f;
     __syncthreads();
 
-    auto gC = make_tensor(make_gmem_ptr(C), make_layout(make_shape(Int<BM>{}, Int<BN>{}),
-                                                        make_stride(Int<BN>{}, Int<1>{})));
-    auto thr = mma.get_thread_slice(threadIdx.x);
-    auto tCsA = thr.partition_A(sA);
-    auto tCsB = thr.partition_B(sB);
-    auto tCgC = thr.partition_C(gC);
-
-    auto tCrA = thr.make_fragment_A(tCsA);  // SM90: DescriptorIterator, 不是寄存器!
-    auto tCrB = thr.make_fragment_B(tCsB);
-    auto tCrC = thr.make_fragment_C(tCgC);
-    clear(tCrC);
-
-    if (thread0()) {
-        printf("      make_fragment_A = ");
-        print(tCrA);
-        printf("\n      每线程占 %d 字节 (只是个描述符, 不是 A 的数据)\n", int(sizeof(tCrA)));
+    if (threadIdx.x == 0) initialize_barrier(bar, 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        set_barrier_transaction_bytes(bar, tx_bytes);
+        auto gc = tma.get_tma_tensor(make_shape(Int<OM>{}, Int<ON>{}));
+        auto gt = local_tile(gc, Shape<Int<CM>, Int<CN>>{}, make_coord(blockIdx.x, blockIdx.y));
+        auto per = tma.get_slice(0);
+        copy(tma.with(bar), per.partition_S(gt), per.partition_D(sT));
     }
+    __syncthreads();
+    wait_barrier(bar, 0);
 
-    // WGMMA 固定四步。注意没有 copy(tCsA, tCrA) —— 硬件直接读 smem
-    warpgroup_arrive();
-    gemm(mma, tCrA, tCrB, tCrC);
-    warpgroup_commit_batch();
-    warpgroup_wait<0>();
-
-    copy(tCrC, tCgC);
+    // 把整块 smem 原样倒出来 (按 tile 排, 不是按矩阵排), host 侧检查
+    int tile_id = blockIdx.x * gridN + blockIdx.y;
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) dump[tile_id * CM * CN + i] = smem[i];
 }
 
-template <class SLayA, class SLayB>
-static void run_wgmma(const char* tag, SLayA sla, SLayB slb) {
-    auto mma = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
+static void section33_out_of_bounds() {
+    print_separator("§3.3  边界: tile 不整除时硬件自己兜");
 
-    half_t *dA, *dB;
-    float* dC;
-    CUDA_CHECK(cudaMalloc(&dA, BM * BK * sizeof(half_t)));
-    CUDA_CHECK(cudaMalloc(&dB, BN * BK * sizeof(half_t)));
-    CUDA_CHECK(cudaMalloc(&dC, BM * BN * sizeof(float)));
-    half_t* hA = new half_t[BM * BK];
-    half_t* hB = new half_t[BN * BK];
-    for (int i = 0; i < BM * BK; ++i) hA[i] = half_t(float((i % 7) - 3));
-    for (int i = 0; i < BN * BK; ++i) hB[i] = half_t(float((i % 5) - 2));
-    CUDA_CHECK(cudaMemcpy(dA, hA, BM * BK * sizeof(half_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dB, hB, BN * BK * sizeof(half_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(dC, 0, BM * BN * sizeof(float)));
+    const int gM = (OM + CM - 1) / CM, gN = (ON + CN - 1) / CN;
+    printf("  矩阵 %dx%d, tile %dx%d -> grid (%d,%d)\n", OM, ON, CM, CN, gM, gN);
+    printf("  右下角 CTA (%d,%d) 覆盖行 %d..%d, 列 %d..%d, 只有 %dx%d = %d 个元素有效\n\n",
+           gM - 1, gN - 1, (gM - 1) * CM, gM * CM - 1, (gN - 1) * CN, gN * CN - 1, OM - (gM - 1) * CM,
+           ON - (gN - 1) * CN, (OM - (gM - 1) * CM) * (ON - (gN - 1) * CN));
 
-    printf("    %s\n", tag);
-    wgmma_kernel<<<1, int(size(mma))>>>(dA, dB, dC, mma, sla, slb);
+    float *d_in, *d_dump;
+    CUDA_CHECK(cudaMalloc(&d_in, sizeof(float) * OM * ON));
+    CUDA_CHECK(cudaMalloc(&d_dump, sizeof(float) * gM * gN * CM * CN));
+    float* h_in = new float[OM * ON];
+    for (int i = 0; i < OM * ON; ++i) h_in[i] = float(i + 1);  // 从 1 开始, 好和填充的 0 区分
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, sizeof(float) * OM * ON, cudaMemcpyHostToDevice));
+
+    auto mIn = make_tensor(make_gmem_ptr(d_in),
+                           make_layout(make_shape(Int<OM>{}, Int<ON>{}), LayoutRight{}));
+    auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mIn, slay);
+
+    oob_kernel<<<dim3(gM, gN), NTHR>>>(tma, d_dump, gN);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    float* hC = new float[BM * BN];
-    CUDA_CHECK(cudaMemcpy(hC, dC, BM * BN * sizeof(float), cudaMemcpyDeviceToHost));
-    int bad = 0;
-    for (int m = 0; m < BM; ++m)
-        for (int n = 0; n < BN; ++n) {
-            double acc = 0;
-            for (int k = 0; k < BK; ++k) acc += float(hA[m * BK + k]) * float(hB[n * BK + k]);
-            if (fabs(acc - hC[m * BN + n]) > 1e-3) ++bad;
-        }
-    printf("      C = A*B^T  %s\n", bad == 0 ? "正确" : "错误");
+    float* h_dump = new float[gM * gN * CM * CN];
+    CUDA_CHECK(cudaMemcpy(h_dump, d_dump, sizeof(float) * gM * gN * CM * CN,
+                          cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaFree(dA));
-    CUDA_CHECK(cudaFree(dB));
-    CUDA_CHECK(cudaFree(dC));
-    delete[] hA;
-    delete[] hB;
-    delete[] hC;
-}
+    // 逐 tile 检查: 界内 = 原值, 界外 = 0 (不是 -1, 说明硬件确实写过)
+    bool ok = true;
+    int zeros = 0, dirty = 0;
+    for (int bx = 0; bx < gM; ++bx)
+        for (int by = 0; by < gN; ++by)
+            for (int r = 0; r < CM; ++r)
+                for (int c = 0; c < CN; ++c) {
+                    int gr = bx * CM + r, gc = by * CN + c;
+                    float got = h_dump[(bx * gN + by) * CM * CN + r * CN + c];
+                    float want = (gr < OM && gc < ON) ? h_in[gr * ON + gc] : 0.f;
+                    if (got != want) ok = false;
+                    if (got == 0.f) ++zeros;
+                    if (got == -1.f) ++dirty;
+                }
 
-static void section54_who_picks() {
-    print_separator("§5.4  谁挑 layout: TMA 不挑, WGMMA 挑");
+    printf("    界内元素 = 原值, 界外元素 = 0    -> %s\n", ok ? "正确" : "错误");
+    printf("    被填 0 的位置 %d 个, 仍是 -1 (硬件没碰过) 的位置 %d 个\n", zeros, dirty);
+    printf("\n  kernel 里一行 predicate 都没有 —— if (r < M) 那种判断完全不需要。\n");
+    printf("  这是 §2.2 那个坐标 tensor 的直接好处: 坐标越界是合法的, 硬件看到\n");
+    printf("  越界坐标就跳过; 而普通 tensor 切出来的越界指针一读就崩。\n");
 
-    // 先证明 TMA 连 plain row-major 都搬得对
-    printf("  先看 TMA 对 plain row-major (完全没 swizzle):\n");
-    {
-        auto plain3 = make_layout(make_shape(Int<TM>{}, Int<TK>{}, Int<1>{}),
-                                  make_stride(Int<TK>{}, Int<1>{}, Int<TM * TK>{}));
-        Buffers buf;
-        bool ok = launch_tma_copy(plain3, buf, false);
-        printf("    plain row-major   落数 %-4s   consumer 列读 = %2d-way\n",
-               ok ? "正确" : "错误", col_conflict_half(plain3(_, _, Int<0>{})));
-    }
-    printf("  -> TMA 搬得对。加上 §5.3 的四种, 五种 layout 全都搬得对。\n");
-    printf("     很容易误解成\"TMA 要求 swizzle\" —— 它不要求。\n");
+    printf("\n  唯一的硬性要求在 gmem 一侧: 除最内层外, 每一维的 stride 必须是\n");
+    printf("  16 字节的整数倍。本例 stride = (%d, 1) float = (%d, 4) 字节,\n", ON, ON * 4);
+    printf("  %d %% 16 == %d, 满足。不满足时要先把矩阵 pad 到合适的宽度。\n", ON * 4, (ON * 4) % 16);
 
-    printf("\n  再看 WGMMA (SM90_64x64x16_F32F16F16_SS, %dx%dx%d half):\n", BM, BN, BK);
-    auto mma = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
-    printf("    size(mma) = %d  <- 一个 warpgroup = 4 个 warp, 不是 32\n\n", int(size(mma)));
-
-    auto shA = make_shape(Int<BM>{}, Int<BK>{});
-    auto shB = make_shape(Int<BN>{}, Int<BK>{});
-    run_wgmma("SW128 atom", tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{}, shA),
-              tile_to_shape(GMMA::Layout_K_SW128_Atom<half_t>{}, shB));
-    run_wgmma("INTER atom (Sw<0>, 无 swizzle 但是规范形式)",
-              tile_to_shape(GMMA::Layout_K_INTER_Atom<half_t>{}, shA),
-              tile_to_shape(GMMA::Layout_K_INTER_Atom<half_t>{}, shB));
-
-    printf("\n    plain row-major  ->  编译期失败, 放不进这个程序里跑\n");
-    printf("    padded stride+8  ->  同样编译期失败\n");
-    printf("    报错都是:\n");
-    printf("      static assertion failed:\n");
-    printf("      \"Not a canonical GMMA_K Layout: Expected stride failure.\"\n");
-    printf("    (想亲眼看到: 把 exercises/ex.cu 里 EX5_TRY_PLAIN_WGMMA 改成 1)\n");
-
-    printf("\n  为什么 WGMMA 这么挑: 它不经过寄存器, 而是把 smem 地址和摆法编码成\n");
-    printf("  一个 descriptor, 硬件照它直读 smem。descriptor 里只有几个比特存\n");
-    printf("  swizzle 模式, 能表达的摆法就 §5.3 那四种。\n");
-
-    printf("\n  所以这一章的 layout 是一份合同:\n");
-    printf("    TMA (生产者) ---- smem layout ----> WGMMA (消费者)\n");
-    printf("     不挑, 都能搬          由消费者定       只认 4 种规范形式\n");
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_dump));
+    delete[] h_in;
+    delete[] h_dump;
 }
 
 int main() {
-    printf("cute_04 v2 —— TMA: 把搬运交给硬件\n");
-    printf("对应 README §5    需要 -arch=sm_90a\n");
+    printf("cute_04 v2 —— TMA store 与边界\n");
+    printf("对应 README §3    需要 -arch=sm_90a\n");
 
-    section51_cpasync();
-    section52_tma();
-    section53_swizzle_modes();
-    section54_who_picks();
+    section31_tma_store();
+    section32_round_trip();
+    section33_out_of_bounds();
 
     print_separator("小结");
-    printf("  §5.1  cp.async: 128 个线程各算地址各发指令\n");
-    printf("  §5.2  TMA: 1 个 lane 描述整块, 硬件搬, mbarrier 按字节等\n");
-    printf("  §5.3  swizzle 模式写在 descriptor 里, 四种可选, 按 TK 整除规则挑最宽的\n");
-    printf("  §5.4  TMA 不挑 layout, WGMMA 编译期挑 —— layout 是两者之间的合同\n");
+    printf("  §3.1  store 用 fence 挡在发起之前, 不用 mbarrier; S/D 方向反过来\n");
+    printf("  §3.2  两端都 TMA: 一趟 load -> 计算 -> store, 搬运指令共两条\n");
+    printf("  §3.3  边界靠硬件 predicate, 越界填 0, kernel 里零 predicate\n");
 
-    printf("\n下一步 (§6): 现在 TMA 搬一块、WGMMA 算一块, 但它们是**串行**的 ——\n");
-    printf("搬的时候计算单元闲着, 算的时候搬运引擎闲着。v3 讲怎么让两者重叠。\n");
+    printf("\n下一步 (§4): 到这里搬运本身已经会了。但**搬进 smem 之后怎么摆**\n");
+    printf("还没管过 —— 摆错了 consumer 读的时候会撞 bank。v3 讲 swizzle。\n");
     printf("\nv2 OK\n");
     return 0;
 }

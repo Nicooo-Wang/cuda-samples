@@ -22,9 +22,9 @@
 
 | 特性 | 章节 |
 |---|---|
-| TMA | cute_04 §5-6, cute_05 §4, cute_06 §4 |
-| WGMMA | cute_04 §5.4, cute_05 §3, cute_06 §4 |
-| Warp Specialization | cute_04 §6.4 (概念), cute_06 §5 (手写) |
+| TMA | cute_04 §2-5, cute_05 §4, cute_06 §4 |
+| WGMMA | cute_04 §4.2 (编译期拒绝), cute_05 §3, cute_06 §4 |
+| Warp Specialization | cute_06 §5 (手写; cute_04 §5 埋下动机) |
 | Block Cluster | cute_06 capstone |
 | Persistent Block | cute_07 |
 

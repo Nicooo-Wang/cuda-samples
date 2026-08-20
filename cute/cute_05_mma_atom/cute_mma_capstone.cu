@@ -257,7 +257,7 @@ int main() {
     printf("\n  但它离 cuBLAS (本机 4096^3 实测约 878 TFLOP/s) 还差得远, 原因有三个,\n");
     printf("  每一个都是 cute_06 的一节:\n");
     printf("    1. **没有流水线**: 搬完才算, 算完才搬, 两个引擎各闲一半。\n");
-    printf("       -> cute_06 v3: 多 stage + PipelineState (cute_04 §6 已跑通骨架)\n");
+    printf("       -> cute_06 v3: 多 stage + PipelineState (cute_04 §5 已跑通骨架)\n");
     printf("    2. **没有 warp 分工**: 同一批线程既发 TMA 又等 WGMMA。\n");
     printf("       -> cute_06 v4: Warp Specialization\n");
     printf("    3. **tile 太小、没有 cluster**: BM=%d 只有一个 warpgroup 在算。\n", BM);

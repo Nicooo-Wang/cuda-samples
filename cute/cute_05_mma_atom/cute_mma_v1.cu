@@ -12,7 +12,7 @@
 //   2. **A/B 不再进寄存器**: 硬件直接按 descriptor 去读 smem
 //      -> mainloop 里那句 copy(tCsA, tCrA) 消失了, ldmatrix 这一步被硬件吃掉
 //
-// 代价是 WGMMA 对 smem 的摆法有硬性要求 (cute_04 §5.4 已经撞过这堵墙):
+// 代价是 WGMMA 对 smem 的摆法有硬性要求 (cute_04 §4.2/§4.5 已经撞过这堵墙):
 // smem layout 必须来自 GMMA::Layout_*_Atom 系列, 普通 row-major 编译期就被拒。
 //
 //   §3.1  WGMMA vs MMA: 把两个 atom 并排打出来   (README §3.1)
@@ -165,7 +165,7 @@ static void show_descriptor() {
 // ===========================================================================
 template <class SLayA, class SLayB>
 __global__ void wgmma_one(const half_t* A, const half_t* B, float* C, SLayA slayA, SLayB slayB) {
-    // smem: WGMMA 要求 128B 对齐 (和 TMA 一样的要求, cute_04 §5.2 条件 3)
+    // smem: WGMMA 要求 128B 对齐 (和 TMA 一样的要求, cute_04 §2.1)
     __shared__ __align__(128) half_t rawA[cosize_v<SLayA>];
     __shared__ __align__(128) half_t rawB[cosize_v<SLayB>];
 
@@ -286,7 +286,7 @@ static void show_gmma_layouts() {
     printf("       本文件 BK = %d, 所以四种都能用。\n", BK);
     printf("    2. 普通 row-major / padding 过的 layout 直接**编译期拒绝**:\n");
     printf("       「Not a canonical GMMA_K Layout: Expected stride failure.」\n");
-    printf("       这就是 cute_04 §2 说「padding 在 SM90 上是死路」的真正原因 ——\n");
+    printf("       这就是 cute_04 §4.2 说「padding 在 SM90 上是死路」的真正原因 ——\n");
     printf("       不是 TMA 拒绝 (TMA 全都能搬), 是 WGMMA 拒绝。\n");
 
     printf("\n  为什么 WGMMA 这么挑? 因为它是硬件直接寻址 smem:\n");

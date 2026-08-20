@@ -12,9 +12,9 @@ cute_04 和 cute_05 给了你全部零件：
 
 | 零件 | 在哪学的 | 干什么 |
 |---|---|---|
-| swizzle smem layout | cute_04 §3 | smem 里怎么摆不撞 bank |
-| TMA | cute_04 §5 | 一个线程描述整块，硬件搬 gmem→smem |
-| mbarrier + PipelineState | cute_04 §6 | 按字节数的 producer/consumer 同步 |
+| swizzle smem layout | cute_04 §4 | smem 里怎么摆不撞 bank |
+| TMA | cute_04 §2 | 一个线程描述整块，硬件搬 gmem→smem |
+| mbarrier + PipelineState | cute_04 §5 | 按字节数的 producer/consumer 同步 |
 | MMA atom / TiledMMA | cute_05 §1-2 | 一条 Tensor Core 指令怎么发 |
 | WGMMA | cute_05 §3 | Hopper 的 warpgroup 级异步 MMA |
 
@@ -164,11 +164,11 @@ mainloop (双 state 独立转):
              ++write_state
 ```
 
-这是 cute_04 §6 跑通的单 CTA 多 stage，铺满整个 grid。两个 `PipelineState`
+这是 cute_04 §5 跑通的单 CTA 多 stage，铺满整个 grid。两个 `PipelineState`
 **都从 0 开始**，不要在 prologue 里预推进（会死锁）。
 
 注意 128×128×64 × 3 stage = 96KB > 48KB 静态上限，所以用 `extern __shared__` +
-`cudaFuncSetAttribute`（cute_04 §6.3 的台阶）。
+`cudaFuncSetAttribute`（cute_04 §5.3 的台阶）。
 
 实测（2048³）：**~428 TFLOP/s** —— 比 v2 快 **6×**。这就是 Hopper 的兑现。
 
@@ -191,7 +191,7 @@ Warp Specialization 的答案：**把线程分成两组，各干各的**。
               ▲ 用 mbarrier 通信 ▲ (就是 v3 那两组 barrier)
 ```
 
-两个手写 WS 的坑（cute_04 §6.4 踩过）：
+两个手写 WS 的坑（cute_04 §5 踩过）：
 
 - **consumer 必须落在 wg0**（warps 0-3）。反过来 warpgroup_arrive/commit 会出问题。
 - producer 的 TMA 只能由 1 个 lane 发，且必须限定在 producer 组：

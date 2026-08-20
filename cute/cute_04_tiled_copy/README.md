@@ -1,744 +1,639 @@
-# Section 04: Smem Layout、Swizzle 与 TMA 搬运（SM90）
+# Section 04: TMA 搬运与 Smem 摆法（SM90 Hopper）
 
-## §0 路线图：这一章解决什么
+> 前置：cute_01（Layout）、cute_02（Tensor）、cute_03（Copy Atom，了解即可）。
+> 本章用 SM90（H200，`-arch=sm_90a`）。目标：**把数据搬进 smem、摆好、再搬出去**，
+> 全程只让一个线程发指令。
 
-cute_03 学会了"怎么把数据搬进 smem"——但搬进去之后，**怎么摆**决定了下一步读它的
-速度。这一章围绕一个不断追问的链条展开：
+## §0 路线图
 
-> 数据摆进 smem 会撞 bank（§1）→ padding 能修但 SM90 不让（§2）→ 所以要用
-> swizzle，它到底怎么映射（§3）→ 会了映射，搬运代码怎么写（§4）→
-> 但 SM90 有专门的搬运硬件 TMA，它怎么用、和手写有什么不同（§5）→
-> 会搬一块了，怎么让搬和算重叠起来（§6）→ 全部用上，capstone 实测（§7）
+cute_03 学会的是"每个线程搬自己那份"。本章的主角是 Hopper 新加的**搬运硬件 TMA**：
+一个线程描述整块搬运，硬件自己去搬。围绕它的问题链：
 
-| §  | 讲什么 | 结尾抛出 | 代码 |
-|---|---|---|---|
-| §1 | bank 模型：为什么按列读慢 32 倍 | 怎么修？ | v0 |
-| §2 | padding：能修，但 SM90 上是死路 | 那用什么？ | v0 |
-| §3 | Swizzle 映射机制（逐比特 / 手算 / 映射表 / M 参数权衡） | 搬运代码要改吗？ | v0 |
-| §4 | 用 CuTe 语义搬运：两个方向都用 `copy()` | 硬件有更好的办法吗？ | v1 |
-| §5 | TMA：没它怎么搬 → 有它怎么搬 → 四种 swizzle 模式 | 搬和算能重叠吗？ | v2 |
-| §6 | Multi-stage：单缓冲 → Double Buffer → Super Buffer → 线程去哪了 | 全用上多快？ | v3 |
-| §7 | Capstone：转置六版（含 TMA 版） | 下一章 | capstone |
-| §8 | 代码地图 + 8 道练习 + 交接到 05/06/07 | — | ex.cu |
+> 没有 TMA 时怎么搬（§1）→ 有了 TMA 怎么搬最小版（§2）→
+> 反方向的 store 和边界（§3）→ 搬进 smem 之后怎么摆（§4）→
+> 怎么让搬和算重叠（§5）→ 全部用上，capstone 转置（§6）
 
-**本章统一用 SM90（H200, `-arch=sm_90a`）。** 不讲 SM80 过渡写法、不讲 `ldmatrix`
-（那是 SM80 的 smem→寄存器指令，SM90 的 WGMMA 直接读 smem，不需要它）。
+| § | 讲什么 | 代码 |
+|---|---|---|
+| §1 | 手写搬运基准：每线程算地址，成本清单五条 | v0 |
+| §2 | TMA load：descriptor / 坐标 tensor / mbarrier，五个新概念逐个拆 | v1 |
+| §3 | TMA store（fence）与越界自动处理 | v2 |
+| §4 | smem 摆法：bank 冲突 → padding 死路 → swizzle → TMA 的四种模式 | v3 |
+| §5 | Multi-stage：单缓冲 → Double Buffer → Super Buffer → tma_partition | v4 |
+| §6 | Capstone：转置（TMA load + swizzle + TMA store） | capstone |
+
+**怎么用这一章**：每节先读 README 的概念部分，再跑对应的 `.cu`，对照输出。
+代码里每个数字都能在 README 里找到解释。
 
 > 本机 `nvidia-smi` 把卡标成 `L20X / 8.9`，但运行时是 **cc 9.0 / 132 SM / 150GB /
 > clusterLaunch=1** 的真 Hopper。所有结论都用 `-arch=sm_90a` 实测得到。
 
 ---
 
-## §1 bank 模型：为什么按列读慢 32 倍
+## §1 没有 TMA 时怎么搬：手写基准
 
-smem 硬件被切成 **32 个 bank**，按 4 字节轮流分配：
-
-```
-float 下标 :   0    1    2    3   ...   31 |  32   33   34  ...
-bank      :   0    1    2    3   ...   31 |   0    1    2  ...
-              └──────── 一轮 32 个 ────────┘   └── 绕回来 ──┘
-```
-
-规则只有一条：
-
-> 一个 warp 的 32 个 lane 落在 **32 个不同 bank** → 一个周期完成。
-> 有 **N 个 lane 落在同一个 bank** → 硬件串行拆成 N 次，即 **N-way conflict**。
-
-### 一个 32×32 float tile 上的两种读法
-
-layout 是 `(32,32):(32,1)`（row-major，行 stride = 32）。偏移公式 `off(r,c) = r*32 + c`：
+先看没有 TMA 时你会怎么写（`cute_tiled_v0.cu`，§1.1）。任务贯穿全章：
 
 ```
-        c=0    c=1    c=2    c=3   ...
- r=0      0      1      2      3   ...      ← 按行读: 偏移连续
- r=1     32     33     34     35   ...
- r=2     64     65     66     67   ...
- r=3     96     97     98     99   ...
-         ↑
-      按列读: 偏移 0, 32, 64, 96 ...
+gmem 里一个 M x N 的 float 矩阵, row-major, stride = (N, 1)
+每个 CTA 负责一个 CM x CN 的 tile:
+  1) 把 tile 搬进 smem
+  2) (在 smem 里做点什么)
+  3) 搬回 gmem
 ```
 
-把偏移换算成 bank（`bank = offset % 32`）：
-
-```
-按行读 s(0, 0..31):   偏移 0  1  2  3 ... 31    bank 0  1  2  3 ... 31   ✓ 32 个不同 bank
-按列读 s(0..31, 0):   偏移 0 32 64 96 ...       bank 0  0  0  0 ...  0   ✗ 全撞 bank 0
-```
-
-**根源**：行 stride = 32，bank 数也 = 32。下一行的同一列 = 偏移 +32 = `32 % 32 = 0`，
-bank 号纹丝不动。而转置这个操作**必然要按列读**——这就是冲突的来源。
-
-> §2 之前先问一句：怎么修才能不撞 bank？
-
----
-
-## §2 padding：能修，但 SM90 上是死路
-
-最直观的修法：把行 stride 从 32 改成 33。
+手写搬运长这样：
 
 ```cpp
-auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-auto pad   = make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<33>{}, Int<1>{}));
-//                                                                        ↑ 只改这里
+for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) {
+    int r = i / CN;                       // 自己算地址
+    int c = i % CN;
+    smem[r * CN + c] = in[(row0 + r) * N + (col0 + c)];   // 自己发 load
+}
+__syncthreads();                          // 全 CTA 栅栏
 ```
 
-每行多占一个 float，列方向偏移变成 `0, 33, 66, 99, ...`，bank 号 `33 % 32 = 1`，
-每行错开 1 个 bank，32 行落到 32 个不同 bank——**冲突消除**。
+这一版是**成本清单**，后面每一版都会拿它对照：
 
-代价三条：
-
-| 代价 | 具体 |
+| 成本 | 手写（§1） |
 |---|---|
-| 多占 smem | `size = 1024` 但 `cosize = 1055`（+3.0%） |
-| 破坏对齐 | 行首不再 128B 对齐 |
-| **WGMMA 编译期拒绝** | SM90 的 Tensor Core 根本不接受这种 layout |
+| 发指令的线程数 | 128 个，每人发自己那几条 |
+| 地址计算 | 每线程每趟各算一次（`i/CN`、`i%CN`、乘 stride） |
+| 边界处理 | tile 不整除时要自己写 `if (r < M && c < N)` |
+| 同步 | `__syncthreads()`，全 CTA 栅栏 |
+| 寄存器 | 每线程几个寄存器存地址和中转值 |
 
-前两条是性能问题，第三条是硬墙。**实测**（探针，`SM90_64x64x16_F32F16F16_SS`）：
+§1.2 把同一件事换成 CuTe 坐标写法（`make_tensor` + `local_tile`）—— 成本清单一条没
+少，但**地址算术收进 Layout 了**。这一小步是给 §2 铺路：TMA 用的正是这套坐标写法。
 
-```
-padded stride BK+8  →  编译失败:
-  static assertion failed: "Not a canonical GMMA_K Layout: Expected stride failure."
-```
-
-是**编译期**失败，不是跑出错。WGMMA 只认几种"标准"layout，padding 不在其中。
-所以在 SM90 上 padding 这条路走不通——**必须用 Swizzle**。
-
-> §2 说"必须用 swizzle"，那 swizzle 到底怎么把偏移映射到别处？§3 逐比特讲。
+> 问：有没有办法让"算地址、发指令"这件事从 128 个线程身上卸下来？
 
 ---
 
-## §3 Swizzle 到底怎么映射
+## §2 TMA load：一个线程描述整块
 
-`Swizzle<B, M, S>` **不改 shape、不多占一个字节**，只改"逻辑坐标 → 偏移"这个映射
-函数，做法是**把偏移的某几个比特异或到另几个比特上**。
+Hopper 新增的 TMA（Tensor Memory Accelerator）是**独立硬件单元**，专做
+gmem↔smem 整块搬运。`cute_tiled_v1.cu` 把 §1 的 gmem→smem 一步换成 TMA，
+其余一字不差。
 
-### §3.1 三个参数的含义
+### §2.1 两步走：host 造 descriptor，kernel 发一条指令
 
-32×32 float tile 的偏移是 10 位（0..1023）：
-
-```
-     bit:   9   8   7   6   5 │  4   3   2   1   0
-            └──── r 的 5 位 ───┘  └──── c 的 5 位 ────┘
-            (因为 off = r*32 + c, 高 5 位就是 r, 低 5 位就是 c)
-
-  B = 参与异或的比特数（异或几位）
-  M = 最低几位不动（保护 2^M 个元素保持连续）
-  S = 异或的距离（目标位和源位相隔几位）
-```
-
-映射公式：
-
-```
-swz_off(r,c) = plain_off  XOR  ( ((plain_off >> S) & mask_B) << M )
-                                  └─ 取出高位段 ─┘   └ 移到低位 ┘
-```
-
-### §3.2 `Swizzle<5,0,5>` 逐步手算
-
-B=5, M=0, S=5。取 `(r,c) = (3,5)`，`plain_off = 3*32 + 5 = 101`：
-
-```
-  plain_off = 101 = 0b0001100101
-                       └─r=3─┘└c=5┘
-                        00011  00101
-
-  第 1 步: 取出高 5 位 (r)          = 0b00011 = 3
-  第 2 步: M=0, 不左移              = 3
-  第 3 步: 和低 5 位异或   c XOR r   = 0b00101 XOR 0b00011 = 0b00110 = 6
-  第 4 步: 拼回去                   = r*32 + 6 = 96 + 6 = 102
-
-  swz_off(3,5) = 102          ← 实测 v0 输出正是 102 ✓
-```
-
-一句话：**用行号去打乱列号**，`c_new = c XOR r`。
-
-### §3.3 打印出整张映射表
-
-`plain` 和 `swizzled` 并排看（v0 会打印这张表）：
-
-```
-plain 偏移 (前 8 行 × 12 列)                swizzled 偏移 Sw<5,0,5>
-      c= 0  1  2  3  4  5  6  7             c= 0  1  2  3  4  5  6  7
- r=0     0  1  2  3  4  5  6  7        r=0     0  1  2  3  4  5  6  7   ← r=0: XOR 0, 不变
- r=1    32 33 34 35 36 37 38 39        r=1    33 32 35 34 37 36 39 38   ← 两两交换
- r=2    64 65 66 67 68 69 70 71        r=2    66 67 64 65 70 71 68 69   ← 每 2 个一组交换
- r=3    96 97 98 99 ...                r=3    99 98 97 96 103 102 ...   ← 每 4 个一组倒转
- ...
-
-  r:          0    1    2    3    4    5    6    7
-  plain:      0   32   64   96  128  160  192  224   → bank 0 0 0 0 0 0 0 0   ✗
-  swizzled:   0   33   66   99  132  165  198  231   → bank 0 1 2 3 4 5 6 7   ✓
-```
-
-**swizzle 后的列偏移序列和 padding 的一模一样（0,33,66,99...），但 cosize 还是 1024。**
-padding 靠"多占空间"把行推开，swizzle 靠"在原地重排"达到同样效果。
-
-### §3.4 M 参数：连续性和消冲突的权衡
-
-`M` 保护最低 M 位不参与异或，即 **2^M 个相邻元素保持连续**。实测（探针全坐标扫描）：
-
-| swizzle | 列读最坏 | 行内最短连续段 | 128-bit atom |
-|---|---|---|---|
-| `plain` | **32-way** | 32 个 float | 可用 |
-| `Sw<5,0,5>` | 1-way | **1 个 float** | **编译失败** |
-| `Sw<4,1,4>` | 2-way | 2 个 float | 编译失败 |
-| `Sw<3,2,3>` | 4-way | **4 个 float** | **可用** |
-
-`Sw<5,0,5>` 把冲突消得最干净，但 M=0 意味着每个元素单独被打乱，行内一个连续对都不剩。
-用 128-bit atom（一次搬 4 个连续 float）去搬它，编译期就挂：
-
-```
-static assertion failed:
-  "Copy_Traits: dst failed to vectorize into registers. Layout is incompatible with this CopyOp."
-```
-
-`Sw<3,2,3>` 保住 4 个 float 连续（M=2 → 2²=4），128-bit atom 能用，代价是 4-way 冲突。
-
-> **选参数的规则**：先定 `M` = 你要用的向量宽度，再让 `B`、`S` 去消冲突。
-> **先保住向量化，再谈消冲突**——这是 §5 里 GMMA 官方原子全是 `M=4` 的原因。
-
-### §3.5 三个不变量
-
-| 不变量 | 为什么 | 实测 |
-|---|---|---|
-| **cosize 不变** | 不多占 smem | plain 1024 = swz 1024 ✓ |
-| **是双射** | 不丢数据、不重叠 | 扫全 1024 坐标无重复 ✓ |
-| **行读仍无冲突** | 写 smem 那步不能变慢 | 全行扫描 1-way ✓ |
-
-注意第三条是"行读**无冲突**"，不是"行内偏移**连续**"。`Sw<5,0,5>` 行内是
-`33 32 35 34`：不连续（不能向量化），但 32 个 lane 仍落 32 个 bank（不冲突）。
-
-> §3 说清楚了映射，但**搬运代码要不要改**？§4 直接回答这个问题。
-
----
-
-## §4 怎么用：搬运代码要不要改？
-
-### §4.1 结论先说
-
-**逻辑代码一行都不用改。** swizzle 藏在 layout 里，`s(r,c)` 自动走新映射。
-只有用了宽向量 atom 时，要按 §3.4 把 `M` 选对，否则编译失败。
-
-### §4.2 三个接口步骤
+TMA 天生分成 host / kernel 两步：
 
 ```cpp
 // ── host 侧 ──────────────────────────────────────────────
-// 第 1 步: 先写出朴素 layout（描述"逻辑形状"）
-auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}),
-                         make_stride(Int<32>{}, Int<1>{}));
+auto mIn  = make_tensor(make_gmem_ptr(d_in), make_layout(make_shape(M, N), LayoutRight{}));
+auto slay = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+auto tma  = make_tma_copy(SM90_TMA_LOAD{}, mIn, slay);
+//                        ^^^^^^^^^^^^^  gmem 视图   smem 摆法
+//        ^^^^ 这个对象里装着 128 字节的 TMA descriptor
 
-// 第 2 步: 套一层 swizzle（描述"实际怎么摆"）
-auto slay = composition(Swizzle<3, 2, 3>{}, plain);
-//                      ^^^^^^^^^^^^^^^^^ 只有这一行是新增的
-
-// 第 3 步: 传进 kernel（静态 layout 是空类型, sizeof==1, 传参不花钱）
-my_kernel<<<grid, block>>>(d_in, d_out, slay);
+// ── kernel 侧 ────────────────────────────────────────────
+copy(tma.with(bar), per_cta.partition_S(gtile), per_cta.partition_D(sT));
+//   ^^^^^^^^^^^^^  ^^^^ 一个线程 (thread 0) 发, 整块由硬件搬
 ```
 
+**descriptor**（host 侧那 128 字节）里存了 gmem 基地址、形状、stride，以及 tile
+形状和 smem 摆法。kernel 里每个 CTA 只需要说"我要第几块"—— 所以只有一个线程
+发一条指令，其余 127 个线程从头到尾不碰搬运。
+
+### §2.2 kernel 里的五个新东西（逐个拆）
+
+| # | 新东西 | 为什么 |
+|---|---|---|
+| 1 | `__grid_constant__ const TmaLoad tma` | 传 cuTensorMap 的硬性要求 |
+| 2 | `tma.get_tma_tensor(shape)` | 源是**坐标 tensor**，不是数据 tensor |
+| 3 | `__shared__ uint64_t bar` | mbarrier，TMA 完成的通知机制 |
+| 4 | `set_barrier_transaction_bytes(bar, N)` | "我要等 N 个字节到位" |
+| 5 | `get_slice(0)` + `partition_S/D` | TMA 的"线程数"是 1，所以 slice 0 |
+
+**1 — `__grid_constant__`**：descriptor 太大（128B），不能按普通参数传，必须是
+`__grid_constant__ const`。
+
+**2 — 坐标 tensor 是什么**（v1 §2.2 会打印）：普通 tensor 装数据，坐标 tensor 装
+`(i,j)` 坐标对：
+
+```
+普通 gmem tensor:  gmem_ptr[32b](0x7f..) o (256,128):(128,1)   <- 有指针
+坐标 tensor:       ArithTuple(_0,_0) o (256,128):(_1@1,_1@0)   <- 只有坐标
+```
+
+`local_tile` 切出来的 `gtile` 是一块坐标。硬件拿坐标去 descriptor 里换地址。
+**为什么必须这样**：用普通 tensor 切片，tile 超出矩阵时会切出**越界的裸指针**，
+一读就崩；而坐标可以越界 —— 硬件看到越界坐标就跳过。这是 §3.3 边界自动处理的
+底层原因。
+
+**3 — mbarrier（异步事务屏障）**：64 位，放在 smem 里。和 `__syncthreads` 的区别：
+后者是全 CTA 栅栏，强制所有人停在同一行；mbarrier 是"等一个条件"—— 这里等的是
+"TMA 搬完了 N 个字节"。只有 1 个线程发 TMA，所以初始化时 `initialize_barrier(bar, 1)`。
+
+**4 — transaction bytes**：`set_barrier_transaction_bytes(bar, tma_transaction_bytes)`
+告诉屏障"这一轮我要等这么多字节"。TMA 搬完会往屏障上"销账"，账齐了等待者放行。
+
+**5 — get_slice(0)**：`make_tma_copy` 造出来的对象里，TMA 被描述成"1 个线程搬
+CM*CN 个元素"的 TiledCopy（`ValLayout: (_1,1024)`）。所以 `get_slice(0)` 取第 0 个
+（唯一一个）slice，`partition_S/D` 照常工作。
+
+### §2.3 同步的三个动作和 phase
+
+mbarrier 在 TMA load 里出现三次，各干一件事：
+
 ```cpp
-// ── kernel 侧: 和没有 swizzle 时完全一样 ──────────────────
-template <class SLay>
-__global__ void my_kernel(float const* in, float* out, SLay slay) {
-    __shared__ __align__(128) float raw[cosize_v<SLay>];   // ← 注意 cosize, 不是 size
-    auto s = make_tensor(make_smem_ptr(raw), slay);
-    s(r, tx) = in[...];      // 写: 和 plain 写法一字不差
-    __syncthreads();
-    out[...] = s(tx, r);     // 读: 和 plain 写法一字不差
+initialize_barrier(bar, 1);              // 开张: 1 个参与者
+set_barrier_transaction_bytes(bar, N);   // 记账: 这一轮要收 N 个字节
+wait_barrier(bar, 0);                    // 等账收齐
+```
+
+mbarrier 没有"计数器归零"的概念，它用一个 **phase bit** 表示"第几轮"：
+
+```
+初始化后     phase = 0
+收齐一轮后   自动翻成 1
+再收齐一轮   翻回 0
+...
+```
+
+所以 wait 时要传"我在等的这一轮的 phase"：**第 k 次使用传 k & 1**（v1 §2.3 用
+同一个 barrier 连搬两块演示）。传错的症状是**死锁**，不是算错 —— 等一个永远不会
+到来的翻转。
+
+```
+wait_barrier(bar, t & 1);   // 第 0 轮等 phase 0, 第 1 轮等 phase 1
+```
+
+### §2.4 成本清单对照
+
+| 成本 | 手写（§1） | TMA（§2） |
+|---|---|---|
+| 发指令线程数 | 128 个 | **1 个** |
+| 地址计算 | 每线程各算 | **host 侧 descriptor 算好** |
+| 边界处理 | 自己写 predicate | **硬件自动**（§3.3） |
+| 同步 | `__syncthreads` | **mbarrier 按字节数等** |
+| 寄存器 | 存地址和中转值 | **几乎为 0** |
+
+> 问：只有 load 一个方向？搬回去那一步呢？边界不整除怎么办？
+
+---
+
+## §3 TMA store 与边界
+
+`cute_tiled_v2.cu` 把搬回 gmem 那一步也换成 TMA。**load 和 store 最重要的区别：
+同步方向反了。**
+
+```
+TMA load   gmem -> smem   数据搬完之后才能用   -> 事后等: mbarrier
+TMA store  smem -> gmem   数据要搬之前就写好   -> 事前挡: fence
+
+load :  发起 --------> [硬件搬] --------> wait_barrier --> 读 smem
+store:  写 smem --> fence --> 发起 --------> [硬件搬] --> (可选 wait)
+```
+
+### §3.1 store 的写法
+
+```cpp
+__syncthreads();      // 1) 等全 CTA 写完 smem
+tma_store_fence();    // 2) 保证这些写对 TMA 硬件 (异步 proxy) 可见
+                      //    少了这行是竞态: 可能搬出去半新半旧的数据
+if (threadIdx.x == 0) {
+    copy(tma_store, per.partition_S(sT), per.partition_D(gtile));
+    //  ^^^^^^^^^^ 没有 .with(bar) —— store 不用 mbarrier
+    tma_store_arrive();   // 提交这一批 store
 }
+tma_store_wait<0>();  // 等到 0 个未完成 (要复用 smem 时必须有)
 ```
 
-三个要点：
+`tma_store_fence()` 包装的是 `fence.proxy.async.shared::cta`：它建立的是**异步代理**
+（TMA 硬件）视角的可见性。换 `__threadfence_block()` 不行 —— 那是普通代理视角，
+保证不了 TMA 看到你的写。方向也反了：`partition_S` 作用在 smem 上，
+`partition_D` 作用在 gmem 坐标上。
 
-1. **`cosize_v<SLay>` 不是 `size`**。padding 的 cosize（1055）比 size（1024）大，
-   用 size 开数组会越界。swizzle 两者相等，但统一写 cosize 不会错。
-2. **`__align__(128)`**。TMA 硬性要求；不对齐会运行时 `misaligned address`。
-3. **layout 在 host 构造，kernel 只做索引**。这是 CUTLASS 通例，也是能"只换一行
-   声明就对比四种方案"的原因。
+load / store 对照：
 
-### §4.3 tile 和内存怎么分配
+| | TMA load | TMA store |
+|---|---|---|
+| 方向 | gmem → smem | smem → gmem |
+| 同步机制 | mbarrier（等字节数） | **fence（挡在发起之前）** |
+| 同步时机 | 搬完之后等 | 发起之前挡 |
+| copy 写法 | `copy(tma.with(bar), S, D)` | `copy(tma, S, D)` |
+| partition_S | gmem 坐标 | smem |
+| partition_D | smem | gmem 坐标 |
 
-以转置为例，把三层尺寸的关系画出来：
+### §3.2 完整一趟
 
-```
-gmem 里的大矩阵 M×N (4096×4096 float)
-┌──────────────────────────────────────┐
-│ ┌────┐ ┌────┐ ┌────┐                 │   每个小方块 = 一个 block 负责的 TILE×TILE
-│ │blk │ │blk │ │blk │  ...            │   grid = (N/TILE, M/TILE)
-│ │0,0 │ │0,1 │ │0,2 │                 │
-│ └────┘ └────┘ └────┘                 │
-│ ┌────┐                               │
-│ │blk │      ...                      │
-│ │1,0 │                               │
-│ └────┘                               │
-└──────────────────────────────────────┘
-           ↓  一个 block 内部
-    TILE×TILE = 32×32 float 的 smem 缓冲
-    ┌─────────────────────┐
-    │  smem tile (32,32)  │  ← 由 slay 描述怎么摆
-    └─────────────────────┘
-           ↑  NTHR=256 个线程协作填充
-      tx = threadIdx.x % 32   (列)
-      ty = threadIdx.x / 32   (行)
-```
+`load -> 计算 -> store` 串起来（v2 §3.2）。整个 kernel 里搬运指令就两条，都由
+thread 0 发；其余 127 个线程做中间的"计算"（这里是一个平方，代表真实负载）。
+注意：**"用了 TMA 线程就空了"这个说法不成立** —— 省掉的是"算地址、发搬运指令"
+这件事，不是线程本身。
 
-对应代码：
+两个方向各要一个 descriptor：
 
 ```cpp
-constexpr int TILE = 32;   // smem 方块边长 —— 决定 smem 用量 (32*32*4 = 4KB)
-constexpr int NTHR = 256;  // 每 block 线程数 —— 决定每线程搬几个
-static dim3 grid() { return dim3(N / TILE, M / TILE); }   // 每个 block 一个方块
+auto tma_load  = make_tma_copy(SM90_TMA_LOAD{},  mIn,  slay);
+auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mOut, slay);
 ```
 
-### §4.4 sweep：线程怎么扫过这个 tile
+一个 descriptor 绑死一个 gmem 张量 + 一个方向，不能共用。
 
-256 个线程填 32×32 = 1024 个格子，每线程管 4 个，分 4 趟：
+### §3.3 边界：硬件自己兜
 
-```
-线程编排:  tx = threadIdx.x % 32     ← 32 个线程横着排, 覆盖一整行
-          ty = threadIdx.x / 32     ← 分成 8 组 (256/32)
-
-        c=0 ────────────────────────► c=31
- r=0    [t0  t1  t2 ...          t31]  ← ty=0  第 1 趟
- r=1    [t32 t33 ...            t63]  ← ty=1
- ...
- r=8    [t0  t1 ...            t31 ]  ← ty=0  第 2 趟 (r += 8)
-```
-
-关键在中转后的那一行 `s(tx, r)`：**tx 在第一个（行）位置**，一个 warp 的 32 个 lane
-读的是同一列的 32 行——正是 §1 的 32-way conflict，也是 swizzle 要修的地方。
-写 gmem 那边 `out[(bx+r)*M + by+tx]` 里 tx 连续 → 合并写。
-
-### §4.5 两个方向都用 CuTe 语义
-
-v1 的结论用一个层层递进的四版展示（都用 `Sw<3,2,3>`，gmem 两侧都合并访存）：
-
-```
-写法                             带宽 (GB/s)     说明
-v1a  裸 / 裸                       2678          起点
-v1b  copy / 裸                     3298          语义不一致, 但更快 (编译器起效)
-v1c  copy / copy  ← 本章目标写法    3436         语义统一, 而且最快
-```
-
-**store 侧能用 `copy()` 的关键是一个"转置视图"**：swizzled layout 不能简单换 mode
-来转置，但可以复合一个转置的 layout：
+v0 手写碰到不整除必须自己写 predicate：
 
 ```cpp
-// sT 满足 sT(m,n) == s(n,m); swizzle 被保留, 只是 stride 从 (32,1) 变 (1,32)
-auto sT = make_tensor(s.data(),
-            composition(slay, make_layout(make_shape(Int<TILE>{},Int<TILE>{}),
-                                          make_stride(Int<TILE>{},Int<1>{}))));
+if (row0 + r < M && col0 + c < N) smem[...] = in[...];
+else                              smem[...] = 0;
 ```
 
-于是"读 sT 的行" == "读 s 的列"，冲突还在原处，但代码是 `copy()`：
+TMA 不用写。v2 §3.3 用 M=40, N=36（右下角 CTA 只有 8x4 有效）实测：界内元素 =
+原值，**界外元素被硬件填 0**，且 kernel 里零 predicate。这正是 §2.2 坐标 tensor
+的直接好处：坐标越界合法，硬件跳过不读。
 
-```cpp
-copy(tc, thr.partition_S(gIn), thr.partition_D(s));    // load:  gmem -> smem
-copy(tc, thr.partition_S(sT),  thr.partition_D(gOut)); // store: smem^T -> gmem
-```
+唯一的硬性要求在 gmem 一侧：**除最内层外，每一维的 stride 必须是 16 字节的整数
+倍**（TMA 按 16 字节盒子访存）。不满足时先把矩阵 pad 到合适宽度。
 
-### §4.6 一个必须避免的"反例"：把转置塞进 gmem stride
-
-v1 里专门演示了一个诱人但错误的写法：不建转置视图，直接让 gmem 目的 layout
-用 `(1,N)` 而不是 `(N,1)`，转置就自动完成。**结果正确，但慢到 swizzle 完全失效**：
-
-```
-把转置放 gmem 侧 (非合并写):  全 523 GB/s, swz 收益 1.00x
-把转置放 smem 侧 (合并写):    plain 2668 / Sw323 3436 GB/s, swz 收益 1.29x
-```
-
-非合并的 gmem 写成了唯一瓶颈，bank 冲突根本排不上号。
-
-> **优化顺序：先保证 gmem 合并，再谈 smem 消冲突。** 顺序错了，后面的 swizzle
-> 全白做。
-
-> §4 让我们会搬一块了。但 gmem→smem 还是"每线程算地址"。SM90 有专门的搬运硬件
-> TMA，§5 讲它。
+> 问：数据搬进 smem 了。但**怎么摆**决定了读它的人快不快 —— 下节讲。
 
 ---
 
-## §5 TMA：把搬运交给硬件
+## §4 搬进 smem 之后怎么摆
 
-### §5.1 没有 TMA 时怎么搬：cp.async，每线程算自己的地址
+`cute_tiled_v3.cu`。v1/v2 的 smem 都是 plain row-major —— 搬运没问题，但**读的人**
+可能很慢。这一节回答"该摆成什么样"，以及"TMA 允许怎么摆"。
 
-v1 的搬运在 SM80/SM90 上都等价于：每个线程算自己的地址、发一条 `cp.async`。
-v2 第一节跑的就是这个基准（128×64 half tile）：
+### §4.1 32 个 bank：为什么按列读慢 32 倍
 
-```
-SM80 cp.async:  每个线程算自己的地址 → 发自己那一份
-   ┌──────────────────────────────────────┐
-   │ t0 算地址→发  t1 算地址→发  ... t255 │  256 个线程都在算地址
-   └──────────────────────────────────────┘
-
-发指令的线程数   128 个 (每人一条)
-地址计算         每线程各算一次
-边界处理         要自己写 predicate
-同步             cp_async_wait + __syncthreads
-寄存器           每线程都占几个存地址
-```
-
-### §5.2 有了 TMA 怎么搬：一个线程描述整块
-
-Hopper 新增的 **独立硬件单元** 专做 gmem↔smem 整块搬运。同一个 tile 换成 TMA：
+smem 硬件按 4 字节轮流分给 32 个 bank：
 
 ```
-SM90 TMA:  一个线程描述整块 → 硬件自己搬
-   ┌──────────────────────────────────────┐
-   │ 1 个线程: "把 gmem(128,64) 那块搬到   │  其余 127 个线程可以去干别的
-   │             smem 这里" → 硬件接手     │
-   └──────────────────────────────────────┘
-
-发指令的线程数   1 个 lane, 一共一条
-地址计算         host 侧 descriptor 算好
-边界处理         硬件自动填 0
-同步             ClusterTransactionBarrier 按字节数等
-寄存器           几乎为 0
-swizzle          写进 descriptor
+float 下标 :   0    1    2  ...   31 |  32   33  ...
+bank      :   0    1    2  ...   31 |   0    1  ...
+              +------ 一轮 32 个 ------+   +- 绕回来 -+
 ```
 
-**descriptor（host 侧那 128 字节）** 里存了：
+规则只有一条：32 个 lane 落 32 个不同 bank → 一个周期；N 个 lane 落同一 bank →
+拆成 N 次（N-way conflict）。
+
+对 `(32,32):(32,1)` 的 tile：行 stride = 32 = bank 数，所以**下一行的同一列偏移
++32，bank 号纹丝不动**：
 
 ```
-      gmem 基地址
-      gmem 形状 (GM, GK), stride (GK, 1)
-      tile 形状 (TM, TK)
-      smem 的 swizzle 模式      <- 就是 §5.3 要讲的四种
-      元素类型 / 越界填充策略
+按行读 sT(0, 0..7):   偏移 0 1 2 3 4 5 6 7     bank 0 1 2 3 4 5 6 7   ✓
+按列读 sT(0..7, 0):   偏移 0 32 64 96 ...      bank 0 0 0 0 ...      ✗ 32-way
 ```
 
-kernel 里只说"搬第 (0,0) 块"，其余全在 descriptor 里。这就是 TMA 的全部含义。
+什么时候按列读？转置、沿列方向的 reduction、以及某些 MMA 取数模式。
 
-五个硬性条件（v2 [§5.2](cute_tiled_v2.cu) 都标在代码里，踩过坑的都在这里）：
+### §4.2 padding：能修，但 SM90 上是死路
 
-1. **src 必须是 `tma.get_tma_tensor(shape)`** —— 坐标 tensor，不是普通 gmem tensor；
-2. **descriptor 在 host 用真实设备指针构造**（用 `nullptr` 会运行时报 `TMA descriptor 201`）；
-3. **smem `__align__(128)`**；
-4. **smem layout 必须带 PIPE 维**，建 atom 时传切片 `slay(_,_,Int<0>{})`；
-5. **partition 用 `tma_partition`**，不是 `partition_S/D`。
+把行 stride 32 改成 33：列偏移变 `0, 33, 66, ...`，每行错开 1 个 bank，冲突消除。
+但三条代价：
 
-### §5.3 TMA 的四种 swizzle 模式
+| 代价 | 具体 |
+|---|---|
+| 多占 smem | cosize 1055 > size 1024（+3.0%），开数组要按 cosize |
+| 破坏对齐 | 行首不再 128B 对齐，而 TMA 要求 128B 对齐 |
+| **WGMMA 编译期拒绝** | SM90 Tensor Core 不接受这种 layout（cute_05 会亲手撞） |
 
-descriptor 里的 swizzle 字段只有几个取值，CuTe 封成四个 layout 原子。
-**名字里的数字是一行占多少字节**：
+第三条是硬墙：WGMMA 把 smem 地址和摆法编码进 descriptor，能表达的只有几种规范
+形式，padding 不在其中。所以在 SM90 上消冲突只有一条路：**swizzle**。
 
-```
-   SW128 = Sw<3,4,3> o (8,64):(64,1)   一行 128 字节 = 64 个 half
-   SW64  = Sw<2,4,3> o (8,32):(32,1)   一行  64 字节 = 32 个 half
-   SW32  = Sw<1,4,3> o (8,16):(16,1)   一行  32 字节 = 16 个 half
-   INTER = Sw<0,4,3> o (8,8) :(8,1)    一行  16 字节 =  8 个 half  (不 swizzle)
-```
+### §4.3 swizzle 怎么映射
 
-v2 用同一个 TMA kernel 跑四种模式（128×64 half tile）：
+`Swizzle<B,M,S>` 不改 shape、不多占一个字节，只改"逻辑坐标 → 偏移"的映射函数，
+做法是把偏移的某几个比特异或到另几个比特上：
 
 ```
-    SW128   一行 128 字节   落数 正确   consumer 列读 =  8-way
-    SW64    一行  64 字节   落数 正确   consumer 列读 =  8-way
-    SW32    一行  32 字节   落数 正确   consumer 列读 =  8-way
-    INTER   一行  16 字节   落数 正确   consumer 列读 =  4-way
-    plain   row-major       落数 正确   consumer 列读 = 32-way  (§5.4 有)
+B = 参与异或的比特数
+M = 最低几位不动 (保护 2^M 个元素保持连续)
+S = 异或的距离
+
+swz(off) = off XOR ( ((off >> S) & mask_B) << M )
 ```
 
-两点结论：
+`Swizzle<5,0,5>` 手算 `(r=3, c=5)`：`off = 101`，取出高 5 位（=r=3），和低 5 位
+异或：`c XOR r = 5 XOR 3 = 6` → `swz = 3*32+6 = 102`（v3 打印验证一致）。
+一句话：**用行号去打乱列号**，`c_new = c XOR r`。
 
-1. **四种模式 TMA 都搬得对**——选哪个不影响正确性，只影响 consumer 读 smem 时撞几路 bank。
-2. **四个原子的 M 全 = 4**（2^4 = 16 half = 32 字节）。这正是 §3.4 规则的体现：
-   先保住向量宽度，再消冲突。官方参数为什么长这样。
-
-**怎么选**：唯一硬约束是 TK 必须能被原子的 K 长度整除。
-
-| TK (half) | SW128(64) | SW64(32) | SW32(16) | INTER(8) |
-|---|---|---|---|---|
-| 64 | ✓ | ✓ | ✓ | ✓ |
-| 32 | ✗ | ✓ | ✓ | ✓ |
-| 16 | ✗ | ✗ | ✓ | ✓ |
-
-实用规则：选能用的里面一行字节数最大的。TK=64 选 SW128。
-
-### §5.4 谁知道要 swizzle？TMA 不挑，WGMMA 挑
-
-容易误解成"TMA 要求 swizzle"。**TMA 不要求**——连 plain row-major 都搬得对（§5.3
-最后一行）。真正拒绝 plain 的是下游的 **WGMMA**，而且是**编译期**拒绝：
+映射表（前几行）：
 
 ```
-WGMMA (SM90_64x64x16_F32F16F16_SS) 实测:
-  SW128 atom              编译通过, 结果正确
-  INTER atom (Sw<0>)      编译通过, 结果正确
-  plain row-major         编译失败: "Not a canonical GMMA_K Layout"
-  padded stride BK+8      编译失败: "Not a canonical GMMA_K Layout"
+ r=1: 33 32 35 34 ...     两两交换
+ r=2: 66 67 64 65 ...     每 2 个一组交换
+ r=3: 99 98 97 96 ...     每 4 个一组倒转
 ```
 
-WGMMA 不靠寄存器读数据，而是把 smem 地址和摆法编码成 **descriptor**，硬件照它直读
-smem。descriptor 里只有几个比特存 swizzle，能表达的摆法就 §5.3 那四种。
+第 0 列的偏移序列从 `0 32 64 96...`（全撞 bank 0）变成 `0 33 66 99...`（全不同）。
+三个不变量（实测）：**cosize 不变**、**是双射**（不丢数据）、**行读仍不冲突**。
 
-所以这一章的 layout 是一份**合同**：
+### §4.4 M 参数：消冲突和向量化的权衡
+
+M 保护最低 M 位不参与异或，即 **2^M 个相邻元素保持连续**。实测（32x32 float）：
+
+| swizzle | 列读最坏 | 行内最短连续 | 128-bit 向量 |
+|---|---|---|---|
+| plain | 32-way | 32 个 float | 可用 |
+| `Sw<5,0,5>` | **1-way** | **1 个 float** | **编译失败** |
+| `Sw<4,1,4>` | 2-way | 2 个 float | 编译失败 |
+| `Sw<3,2,3>` | 4-way | **4 个 float** | **可用** |
+
+最容易犯的错：挑冲突最少的 `Sw<5,0,5>`。它把冲突消得最干净，但 M=0 意味着每个
+元素单独被打乱，128-bit 指令（一次搬 4 个连续 float）编译期就挂。规则：
+
+> **先定 M = 你要用的向量宽度，再让 B、S 去消冲突。先保住向量化，再谈消冲突。**
+
+### §4.5 交给 TMA 时：只有四种模式可选
+
+§4.3/§4.4 的 `Swizzle<B,M,S>` 是**完全自由**的 —— 只要你自己写搬运代码。
+但 descriptor 里存 swizzle 的只有**几个比特**，所以交给 TMA 的 layout 只有四种
+（CuTe 封成四个原子，名字里的数字 = 一行占多少字节）：
 
 ```
-TMA (生产者) ---- smem layout ----> WGMMA (消费者)
- 不挑, 都能搬          由消费者定       只认 4 种规范形式
+float SW128 = Sw<3,4,3> o (8,32):(32,1)    一行 128 字节
+float SW64  = Sw<2,4,3> o (8,16):(16,1)    一行  64 字节
+float SW32  = Sw<1,4,3> o (8,8) :(8,1)     一行  32 字节
+float INTER = Sw<0,4,3> o (8,4) :(4,1)     一行  16 字节
 ```
 
-这也解释了 SM80/SM90 的分工差异（v2 [[§5.4]](cute_tiled_v2.cu) 实测）：
+**M 全 = 4，S 全 = 3** —— 不是巧合，是硬件只支持这些。TMA 接受的 Swizzle 全集
+（CuTe 源码 `copy_traits_sm90_tma_swizzle.hpp`）：
 
 ```
-SM80:  smem ──ldmatrix──► 寄存器 ──mma──► 结果    (显式搬一次, 要 fragment 寄存器)
-SM90:  smem ───descriptor───► wgmma ──► 结果    (不搬! 没有寄存器 fragment)
+M = 4, S = 3, B = 0..3     <- 就是上面四个原子
+M = 5, S = 2, B = 2
+M = 6,        B = 2
 ```
 
-`partition_fragment_A` 在 SM90 返回 `GMMA::DescriptorIterator`（8 字节/线程），而不是
-寄存器数组——所以 mainloop 里**没有 `copy(tCsA, tCrA)`**，ldmatrix 在 SM90 是多余的一跳。
-这也是为什么本章统一不讲 ldmatrix。
+手写的 `Sw<5,0,5>`（M=0）、`Sw<3,2,3>`（M=2）**一个都不在里面**，传给
+`make_tma_copy` 直接编译期失败：
 
-> §5 告诉我们怎么搬一块、怎么选 swizzle。但搬一块和算一块目前是**串行**的：
-> 搬的时候计算单元闲着，算的时候搬运引擎闲着。§6 把它们叠起来。
+```
+static assertion failed: "Unsupported layout swizzle."
+static assertion failed: "Expected 128b=16B=(2^4)B to 512b=64B=(2^6)B base swizzle."
+```
+
+为什么 M 必须 ≥ 4：M=4 表示"最低 16 个元素不参与异或"。float 16 个 = 64 字节，
+half 16 个 = 32 字节 —— TMA 一次访存的最小粒度就在这个量级，比它更细的打乱
+硬件表达不了。§4.4 那条"先保向量宽度"的规则，在 TMA 这里是**强制**的。
+
+### §4.6 用 TMA：官方原子，以及"逻辑连续 vs 物理字节序"
+
+一个必须先说清的事实（v3 §4.6 打印验证）：**TMA 把 XOR 应用在物理地址上**。
+SW128 搬完，smem 的裸字节序第 2 行是：
+
+```
+smem[32..63] = 132 133 134 135 128 129 130 131 140 141 142 143 ...
+```
+
+4 个一组重排 —— 但**用逻辑坐标 `sT(r,c)` 读，拿到的仍是正确数据**，因为 layout
+里带着同一份 swizzle 映射，读取时自动逆映射。所以：
+
+- 逻辑坐标读取 → 永远正确（这也是 §4.6 五种 layout 全部"TMA 正确"的原因）；
+- 物理字节序 → 被 XOR，直接按地址读裸数组会看到乱序。
+
+对比 §4.3/§4.4：**手写搬运时 swizzle 是逻辑层的重排（改 `s(r,c)` 的偏移）；
+TMA 搬运时 swizzle 是硬件层的重排（物理字节序变，逻辑坐标不变）。** 两条路语义
+不同 —— 这也是 TMA 只接受那四种的原因：能写进硬件的比特就那么几个。
+
+descriptor 的 swizzle 字段的用途：① 决定硬件搬运的粒度/对齐（SW128 最宽，搬运
+效率最高，所以工程上选能用的最宽的）；② 当 TMA 直接喂 WGMMA 时（cute_05/06），
+保证 smem 摆成 WGMMA descriptor 认的规范形式 —— 那时它是一份**合同**。
+
+怎么选模式：唯一硬约束是**内层维度必须被原子的内层长度整除**：
+
+```
+CN (float) | SW128(32) | SW64(16) | SW32(8) | INTER(4)
+    32     |    可     |    可    |   可    |   可
+    16     |   不可    |    可    |   可    |   可
+     8     |   不可    |   不可   |   可    |   可
+```
+
+违反是编译期报错（`tile_to_shape: block shape does not divide...`）。
+**实用规则：选能用的里面一行字节数最大的。** 本例 CN=32 float → SW128。
+
+> 问：搬一块、摆一块都会了。但搬和算是**串行**的 —— 搬的时候计算单元闲着。
+> 怎么让它们重叠？
 
 ---
 
-## §6 Multi-stage：让搬运和计算重叠
+## §5 Multi-stage：让搬运和计算重叠
 
-v3 用一个有真实计算量的负载来演示重叠：
+`cute_tiled_v4.cu`。负载是一个真实的流水线形状：`A` 按列切成 NTILE 块，依次搬进
+smem、全 CTA 读出来做 FMA 累加。**注意：这一版不需要 WGMMA**（那是 cute_05 的
+事）—— 计算就用普通 FMA，只要"算"比"搬"慢，重叠的收益就显形。
 
-```
-C = A * B^T    A: 64x4096    B: 64x4096    C: 64x64 (half in, float out)
-K 方向切成 64 块, 每块 (A+B) 搬 16 KB, 喂给 WGMMA 累加。
-这就是一个单 CTA 的 GEMM mainloop —— cute_06 的完整 GEMM 就是把它铺满 grid。
-```
+规模：528 CTA × 128 tile × 8KB = 554MB（HBM 驻留，L2 装不下）—— 只有数据不在
+L2 里，TMA 的延迟才真实，重叠才有意义。
 
-数值（v3 实测，本机）：
+### §5.1 单缓冲：两个引擎各闲一半
 
-| 版本 | smem | 时间 (ms) | TFLOP/s | 相对单缓冲 |
-|---|---|---|---|---|
-| v3a 单缓冲 | 16 KB | 0.0333 | 1.0 | 1.00x |
-| v3b **Double Buffer** | 32 KB | 0.0291 | 1.2 | **1.14x** |
-| v3c Super Buffer (3) | 48 KB | 0.0277 | 1.2 | 1.20x |
-| v3c Super Buffer (4) | 64 KB | 0.0275 | 1.2 | 1.21x |
-
-> 数字随邻居负载波动，看相对关系。绝对数值低是因为负载只有一个 CTA——真正吃满
-> 吞吐要等 cute_06 铺满整个 grid。这里看重叠本身。
-
-### §6.1 单缓冲：两个引擎各闲一半
-
-只有一个 smem buffer，所以时间线是：
+只有一个 smem buffer，每轮必须"等搬完 → 算 → 等读完"，时间线：
 
 ```
 TMA   : [搬0]      [搬1]      [搬2]
-WGMMA :      [算0]      [算1]      [算2]
+计算  :      [算0]      [算1]      [算2]
 ```
 
-每一轮必须等搬完才能算、等算完才能搬下一块（否则覆盖正在用的数据）。
-两个引擎轮流干活，各闲一半。
+两个引擎轮流干活，各闲一半。（v4 实测 0.146 ms，作为 1.00x 基准。）
 
-### §6.2 Double Buffer：2 个 buffer 轮换
+### §5.2 Double Buffer：2 个 buffer 轮换
 
-有了两个 buffer，`搬 k+1` 和 `算 k` 能同时进行：
-
-```
-TMA   : [搬0][搬1][搬2][搬3]
-WGMMA :      [算0][算1][算2]
-          ^^^^ 搬 k+1 和算 k 重叠
-```
-
-需要**两组 barrier**：
+两个 buffer，`搬 k+1` 可以和 `算 k` 同时进行。需要**两组 barrier**：
 
 ```
-full[s]   生产者→消费者:  "buffer s 已装满, 可以算了"  按字节数等 (TMA 专用)
-empty[s]  消费者→生产者:  "buffer s 已用完, 可以覆盖了" 按到达数等
+full[s]   生产者→消费者: "buffer s 已装满"   按字节数等 (TMA 专用)
+empty[s]  消费者→生产者: "buffer s 已用完"   按到达数等 (NTHR 个线程各 arrive 一次)
 ```
 
-用 mbarrier 而不是 `__syncthreads`：`__syncthreads` 是全 block 栅栏，会强制所有人
-停在同一行；这里需要的是"针对某个 buffer 的细粒度等待"，让两组工作各走各的。
-
-**一个必踩的坑（v3 §6.2 实测，第一版直接死锁）：**
+代码骨架：
 
 ```cpp
-auto wst = cutlass::PipelineState<STAGES>();   // ← 都从 0 开始
-auto rst = cutlass::PipelineState<STAGES>();
-// prologue 把 STAGES 个 buffer 都填满后, 千万别想着"write_state 也该预推进 ++STAGES 次"
-// —— 预推进会让第一次 empty->wait 用错 phase, 死锁两分钟。
+// prologue: 填满全部 STAGES 个 buffer (tile s -> buffer s)
+// 之后 tile k 永远落在 buffer k % STAGES
+for (int s = 0; s < STAGES; ++s) if (threadIdx.x == 0) {
+    set_barrier_transaction_bytes(full[s], tx_bytes);
+    copy(tma.with(full[s]), ..., sT(_, _, s));
+}
+
+for (int k = 0; k < NTILE; ++k) {
+    int s = k % STAGES;
+    int phase = (k / STAGES) & 1;          // buffer s 第几轮被用
+    wait_barrier(full[s], phase);          // 等装满
+    ...算...;
+    arrive_barrier(empty[s]);              // 通知用完
+    int knext = k + STAGES;
+    if (knext < NTILE) {
+        wait_barrier(empty[s], phase);     // 先等空, 再覆盖
+        if (threadIdx.x == 0) copy(tma.with(full[s]), ..., sT(_, _, s));
+    }
+}
 ```
 
-### §6.3 Super Buffer：更多 stage，以及 48KB 那道台阶
+phase 公式从 §2.3 的 `k & 1` 变成 `(k / STAGES) & 1` —— 同一个 barrier 每隔
+STAGES 轮用一次。**prologue 填满后不要"预推进"任何状态**（cute_06 用
+`PipelineState` 时踩过的坑）：full/empty 都从 phase 0 开始，写错是死锁。
 
-stage 越多，能容忍的延迟越长（TMA 提前搬得更远）。但**收益递减**——看 §6 的表，
-2→3 只有 ~5% 提升，3→4 几乎没了。smem 却是线性涨的。
+v4 实测：单缓冲 0.150 ms → Double Buffer 0.131 ms（**1.11x**）。
 
-再往上还有一道**硬台阶**：静态 `__shared__` 上限 **48KB**。实测 v3 的 STAGES=3
-（48KB）勉强在限内，STAGES=4（64KB）直接 ptxas 报错：
+### §5.3 Super Buffer：更多 stage，以及 48KB 台阶
 
-```
-ptxas error: uses too much shared data (0xc000 max)
-```
+| STAGES | smem | 时间 (ms) | 相对单缓冲 |
+|---|---|---|---|
+| 1 | 8 KB | 0.150 | 1.00x |
+| 2 | 16 KB | 0.131 | 1.11x |
+| 3 | 24 KB | 0.130 | 1.12x |
+| 4 | 32 KB | 0.132 | 1.10x |
 
-要吃到 H200 的 227KB 必须换 **动态 smem**：
+stage 越多，TMA 提前搬得越远，容忍的延迟越长 —— 但 smem 线性涨、收益递减，
+**stage 不是越多越好**。再往上还有一道硬台阶：**静态 `__shared__` 上限 48KB**
+（0xc000），超过直接 ptxas 报 `uses too much shared data`。要吃到 H200 的 227KB
+必须换**动态 smem**：
 
 ```cpp
-// kernel 里
-extern __shared__ char smem[];
-half_t* rawA = reinterpret_cast<half_t*>(smem);      // A 放偏移 0 (descriptor 期望)
-half_t* rawB = rawA + cosize_v<SLayA>;               // B 紧跟
-
-// host 侧, launch 前
-cudaFuncSetAttribute(kptr, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-// 并且 launch 时在 smem_size_in_bytes 里申请
+extern __shared__ char smem[];                    // kernel 里
+cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);  // host
+k<<<grid, block, bytes>>>();                      // launch 时申请
 ```
 
-v2 的 §5.2 用静态（单缓冲 16KB 而已），v3 的 STAGES=3/4 用动态。
-**这就是官方例子用 `SharedStorage` 结构体 + `cudaFuncSetAttribute` 的原因**——
-SM90 GEMM 的 smem 动辄 100KB 以上，绕不开这道台阶。
+这就是官方例子（`wgmma_tma_sm90.cu`）用 `SharedStorage` 结构体 + 动态 smem 的原因
+—— SM90 GEMM 的 smem 动辄 100KB 以上。
 
-### §6.4 线程去哪了 / Warp Specialization
+### §5.4 tma_partition：cute_05/06 用的写法
 
-先纠正一个常见误解。**"用了 TMA 线程就空着了"这个说法不成立。** 看 v3b 的循环体：
+v1–v4 用的都是 `make_tma_copy + get_slice(0) + partition_S/D`（把 TMA 当"1 线程的
+TiledCopy"）。但 CUTLASS 的 GEMM 代码（cute_05 capstone、cute_06 v3+）用另一套：
+`make_tma_atom + tma_partition`。两个必须知道的差异：
 
-```
-    1 个 lane   发 TMA
-  128 个线程    一起做 WGMMA     <- 其余 127 个在算, 不是闲着
-```
+1. **smem layout 必须带 PIPE 维**（`(CM,CN,1)`），建 atom 时传切片 `slay(_,_,Int<0>{})`；
+2. **partition 用 `tma_partition`**，得到 gmem 侧 `(TMA,)` 和 smem 侧 `(TMA,PIPE)`；
+   发指令的 lane 用 `elect_one_sync()` 自己选。
 
-真正的问题是别的：
+```cpp
+auto tma = make_tma_atom(SM90_TMA_LOAD{}, mA, slay3(_, _, Int<0>{}), tile_shape);
 
-> **同一批线程既要发搬运又要等计算，两件事被串在一条指令流上。**
-> `warpgroup_wait<0>()` 之后所有线程（包括发 TMA 那个 lane）都得等 MMA 完成，
-> 于是"发下一块 TMA"这件事被 MMA 挡住了。
-
-解法是**换分工方式**：
-
-```
-v3b 统一分工:                Warp Specialization (cute_06 完整实现):
-+---------------------+      +------------------+------------------+
-| warp 0 1 2 3        |      | producer: 只发TMA| consumer: 只算   |
-| 都做 WGMMA          |      | 不参与 MMA       | 不做 WGMMA 以外的|
-| 其中 1 个 lane 发TMA|      | 一路往前抢跑     | 事               |
-+---------------------+      +------------------+------------------+
-        |                           |               |
-   一条指令流                   各自独立的指令流, 用 mbarrier 通信
+auto p  = tma_partition(tma, Int<0>{}, Layout<_1>{},
+                        group_modes<0, 2>(sT), group_modes<0, 2>(gt));
+auto tAg = get<0>(p);   // (TMA,)      gmem 侧
+auto tAs = get<1>(p);   // (TMA, PIPE) smem 侧
 ```
 
-producer warp 不做 MMA，所以能一路往前把后面几块 TMA 全发出去，不被任何
-`warpgroup_wait` 挡住。这就是 **Warp Specialization**。
+**为什么 CUTLASS 用这套**：multicast（一个 CTA 搬给整簇）需要把"第几个 CTA"也
+当成 slice 表达，TiledCopy 的线程映射不够用；`tma_partition` 把 slice 选择完全
+交给你。**写法不同，搬的还是同一件事** —— 一个线程一条指令、硬件搬、barrier 等。
 
-v3 只给概念不给完整 kernel，原因有两条（都写死在 v3 §6.4 注释里）：
-
-1. **概念正确性 v3b/v3c 已经证明**——128 个线程在算、只有 1 个 lane 在搬，重叠全靠
-   mbarrier 而非 `__syncthreads`；
-2. **WS 的收益要在大 GEMM 上才显**——单 CTA 的 64×64 负载连 TMA 延迟都没喂饱，
-   硬上 WS 只会把 mbarrier 开销加回去。
-
-完整的 WS kernel（2 个 warpgroup + `setmaxnreg` 寄存器再分配：producer 少要、
-consumer 多要）是 **cute_06 的 capstone**。
-
-> §6 用 pipeline 证明了重叠的价值。§7 把本章所有工具用到一个完整的转置上，实测。
+> 问：全部工具都有了，串起来做个完整的活 —— 转置。
 
 ---
 
-## §7 Capstone：转置 + TMA
+## §6 Capstone：转置
 
-矩阵转置是检验 smem layout 最干净的例子：读 gmem 合并、写 gmem 合并，
-**所有冲突都被挤到"按列读 smem"这一步**，于是 layout 成了唯一的变量。
-
-### v1–v5：float 8192² 转置
+`cute_tiled_capstone.cu`。转置是检验 smem 摆法最干净的任务：**读 gmem 合并、
+写 gmem 合并，所有冲突都被挤到"读 smem"这一步**。六版，每版只换一件事：
 
 ```
-v1 naive（不过 smem）            v2-v5 共用同一个 transpose_smem kernel,
-v2 plain（32-way）              差别只在 host 侧那一行 layout 声明:
-v3 padded (stride 33)           swap/plain/Sw<5,0,5>/Sw<3,2,3>
-v4 Swizzle<5,0,5>
-v5 Swizzle<3,2,3>
+t1  手写 + plain smem        32-way 冲突的起点
+t2  手写 + SW128 smem        手写搬运也吃 swizzle 红利
+t3  TMA load + plain smem    搬运换硬件, 转置逻辑不动
+t4  TMA load + SW128 smem    §4 的写法
+t5  TMA load + TMA store     本章终点: 两条搬运指令, 其余线程只做转置
+t6  不整除的矩阵             硬件自动兜边界
 ```
 
-实测：
-
-| 版本 | 时间 (ms) | 带宽 (GB/s) | 相对 plain | 列读 | SM90 可用 |
-|---|---|---|---|---|---|
-| v1 naive | 0.982 | 547 | — | — | ✓ |
-| v2 plain smem | 0.434 | 1238 | 1.00x | 32-way | ✓ |
-| v3 padded | 0.185 | 2903 | **2.34x** | 1-way | ✗ WGMMA 拒绝 |
-| v4 `Sw<5,0,5>` | 0.198 | 2718 | **2.20x** | 1-way | 冲突最少不能向量化 |
-| v5 `Sw<3,2,3>` | 0.199 | 2697 | **2.18x** | 4-way | ✓ 和 GMMA 官方案 |
-
-怎么读：
-
-- **v2→v3/v4/v5 的 2.2x 以上**是消掉 32-way conflict 的直接收益；
-- **v3/v4/v5 只差几个百分点**——冲突已经不是瓶颈。选哪个该看**可用性**不看性能：
-  padding 在 SM90 过不了 WGMMA 编译期检查；`Sw<5,0,5>` 用不了宽向量 atom；
-  只有 `Sw<3,2,3>` 两条都满足（M=2 → 4-float 连续），这正是 GMMA 官方原子的路线。
-- **性能排序 ≠ 可用性排序**，这是本章最重要的工程结论。
-
-### v6：TMA 版转置
-
-v6 把 gmem→smem 换成 TMA（§5.2 的五个硬条件 + §5.3 的 SW128 smem layout），
-先用上面的转置视图读出来，再合并写 gmem：
+实测（1024x1024 float，tile 32x32）：
 
 ```
-v6  TMA 版转置  (half 2048×2048, tile 128x128)
-    转置结果 正确    ~0.011 ms   ~1500 GB/s   (随机器波动)
+t1  手写 + plain smem       列读 32-way   正确
+t2  手写 + SW128 smem       列读 16-way   正确
+t3  TMA load + plain smem   列读 32-way   正确
+t4  TMA load + SW128 smem   列读 16-way   正确
+t5  TMA load + TMA store    列读 16-way   正确
+t6  越界 1000x640           正确
 ```
 
-**为什么 v6 单独展示、不在 v1-v5 的 float 表里？** 三个理由：
+注意列读只从 32-way 降到 16-way：tile 32x32 只用到 SW128 原子 8 行模式的一半；
+tile 更大（128x128，cute_05 之后）会降到 8-way。**plain 的 32-way 是实打实的最坏
+情况，这才是 swizzle 要消的。**
 
-1. **TMA 的 SW128 descriptor 天生是 16-bit 的**（§5.3）：一行 128 字节 = 64 个 half。
-   给 float 用要另配几何，不是天然适合。
-2. **TMA 擅长的是"整块搬进 smem 喂 WGMMA"**——它的价值由 §6 的流水线证明了。
-   纯转置这种"转换操作"瓶颈在 bank 冲突，不在搬运指令，TMA 帮不上大忙。
-3. 所以 v6 的存在是为了证明**搬运这一步能交给硬件**，且换对；它不参与和 v1-v5
-   的性能比较（数据本身就不同：half/2048² vs float/8192²）。
+### §6.1 t5 的转置怎么做
 
-> §7 之后，你已经有了：swizzle layout（§3）、CuTe 语义搬运（§4）、TMA（§5）、
-> multi-stage 流水线（§6）。下一章（cute_05 MMA）把这些接上 Tensor Core。
+t5 的转置用**手写 + TMA store**，不是"转置视图 + TMA store"。为什么？（这是
+§4.6 的直接应用 —— TMA store 按 smem **物理字节序**搬出，视图只改逻辑坐标
+不改物理字节序，搬出去是原样的行，不是转置后的列。实测过，错的。）
+
+所以"交给硬件"的部分是**搬运**，转置本身仍是普通代码：
+
+```cpp
+__shared__ float tmp[CM * CN];
+for (int i = threadIdx.x; i < CM * CN; i += blockDim.x)
+    tmp[i] = sT(i % CN, i / CN);     // 读: 转置着读
+__syncthreads();                     // 读和写之间必须隔一道栅栏
+for (int i = threadIdx.x; i < CM * CN; i += blockDim.x)
+    sT(i / CN, i % CN) = tmp[i];     // 写: 原位置
+```
+
+不能原地 `sT(r,c) = sT(c,r)`：目标 `(r,c)` 的源 `(c,r)` 可能刚被别的线程改过。
+先全 CTA 读进临时数组、隔一道 `__syncthreads`、再写 —— 这个两阶段模式以后
+（cute_06 的 GEMM epilogue 之类）还会见到。
+
+### §6.2 t6 越界版
+
+`1000x640`（1000 % 32 = 8），grid (32,20)。最右一列 CTA 的界外部分由硬件 load
+填 0，转置后再由 store 跳过不写。**全程零 predicate，结果正确。**
 
 ---
 
-## §8 代码地图 + 练习 + 交接
+## §7 代码地图 + 练习 + 交接
 
 | 文件 | 内容 | 对应 |
 |---|---|---|
-| `cute_tiled_v0.cu` | bank 模型、padding、Swizzle 逐比特推导 + 映射表 + M 参数 | §1–3 |
-| `cute_tiled_v1.cu` | CuTe 语义搬运：两端都用 `copy()`、转置视图、反例 | §4 |
-| `cute_tiled_v2.cu` | TMA：cp.async 对照、五种 layout、四种 swizzle、WGMMA 合同 | §5 |
-| `cute_tiled_v3.cu` | Multi-stage：单缓冲 → Double → Super → WS 概念 | §6 |
-| `cute_tiled_capstone.cu` | 转置六版（含 TMA 版）实测 | §7 |
-| `exercises/ex.cu` | 8 道可自检练习 | §8 |
+| `cute_tiled_v0.cu` | 手写搬运基准（每线程算地址）+ CuTe 坐标写法 | §1 |
+| `cute_tiled_v1.cu` | TMA load：descriptor、坐标 tensor、mbarrier、phase | §2 |
+| `cute_tiled_v2.cu` | TMA store（fence）、完整一趟、越界自动处理 | §3 |
+| `cute_tiled_v3.cu` | bank 模型、padding、swizzle 映射、TMA 四种模式 | §4 |
+| `cute_tiled_v4.cu` | Multi-stage：单缓冲 → Double → Super → tma_partition | §5 |
+| `cute_tiled_capstone.cu` | 转置六版（含 TMA 两端 + 越界） | §6 |
+| `exercises/ex.cu` | 8 道可自检练习 | §7 |
 
-跑：`make run`（依次跑 v0/v1/v2/v3/capstone），`make ex`（练习）。
+跑：`make run`（依次跑 v0..capstone），`make ex`（练习）。
 
 ## 练习
 
 进 `exercises/`，把 `ex.cu` 里的 TODO 填完，`make run` 自动判 PASS/FAIL。
 参考解答在 `exercises/solutions.md`。（8 道，后两题给足提示。）
 
-**练习 1 — 数 bank ★☆☆**（§1）
+**练习 1 — 数 bank ★☆☆**（§4.1）
 `(32,32):(32,1)` 的 float tile，一个 warp 读第 5 列时最热的 bank 被请求几次？
 
-**练习 2 — 手算 swizzle 映射 ★★☆**（§3.2）
-`Swizzle<5,0,5>` 作用在 `(32,32):(32,1)` 上，手算 `swz_off(6, 3)`。按 §3.2 四步走。
+**练习 2 — 手算 swizzle 映射 ★★☆**（§4.3）
+`Swizzle<5,0,5>` 作用在 `(32,32):(32,1)` 上，手算 `swz_off(6, 3)`。按 §4.3 四步走。
 
-**练习 3 — 选 M 保住向量化 ★★★**（§3.4）
+**练习 3 — 选 M 保住向量化 ★★★**（§4.4）
 128-bit atom 搬 32×32 float tile，`Sw<5,0,5>`/`Sw<4,1,4>`/`Sw<3,2,3>` 哪些能用？
 注意冲突最少的那个未必能用。
 
-**练习 4 — 选对 GMMA 原子 ★★☆**（§5.4）
-`(BM=128, BK=32)` 的 half smem，SW128/64/32/INTER 哪些可用？
+**练习 4 — 选对 TMA 模式 ★★☆**（§4.6）
+`CN=32` 的 float tile，SW128/64/32/INTER 哪些可用？选了会怎样？
 
-**练习 5 — 谁挑 layout ★★☆**（§5.2 §5.3）
-一块 plain row-major 的 smem：TMA 能搬对吗？WGMMA 能编译过吗？两个 true/false。
+**练习 5 — TMA 语义 ★★☆**（§2 §4.6）
+(a) 手写 swizzle 和 TMA 的 swizzle 语义差在哪？(b) plain smem 交给 TMA 能搬对吗？
 
-**练习 6 — 修一个 layout bug ★★★**（§3 §4）
-转置结果正确但列读 32-way。**只改 `slay` 一行**，同时满足列读 ≤4-way 且行内连续 ≥4。
+**练习 6 — 修一个转置 bug ★★★**（§6.1）
+转置结果正确但慢。**只改 smem layout 一行**，让列读 ≤ 16-way。
 
-**练习 7 — 手写一段 TMA 搬运 ★★★**（§5.2）
-用 TMA 把 GM×GK 的一个 TM×TK tile 搬进 smem。五个 TODO 对应五个硬性条件，
-提示都在 v2 §5.2 的 `copy_tma_kernel` 里。**盖住参考实现默写一遍才是目的**。
+**练习 7 — 手写一段 TMA 搬运 ★★★**（§2）
+用 TMA 把 GM×GK 的一个 TM×TK tile 搬进 smem。五个 TODO 对应 §2.2 的五个新东西，
+提示都在 v1 §2.1 的 `copy_tma_kernel` 里。**盖住参考实现默写一遍才是目的**。
 
-**练习 8 — TMA Double Buffer ★★★**（§6.2）
-把单缓冲 TMA→WGMMA 改成 2-stage。三个 TODO；**最易错的一行是 `PipelineState`
-不能预推进**（写错的症状是死锁，练习里跑 5 次专门抓它）。
+**练习 8 — TMA Double Buffer ★★★**（§5.2）
+把单缓冲 TMA 循环改成 2-stage。三个 TODO；**最易错的一行是 phase 公式** ——
+`(k / STAGES) & 1` 写错成 `k & 1` 的症状是死锁（练习里跑 5 次专门抓它）。
 
 ### 交接
 
 | 到 | 学什么 | 这里已经给了什么 |
 |---|---|---|
-| cute_05 | MMA / WGMMA / TMA 拼成算子 | §5.3 swizzle layout、§5.4 WGMMA 挑 layout、§4 CuTe 语义 |
-| cute_06 | 完整 GEMM：多 stage 铺满 grid + Warp Specialization + Block Cluster | §6 的 pipeline `PipelineState` 就是 06 mainloop 的骨架 |
-| cute_07 | Persistent Block / tile 调度 | §6.4 的 WS 概念落点 |
+| cute_05 | MMA / WGMMA / TMA 拼成算子 | §4.6 四种模式、§5.4 tma_partition 写法 |
+| cute_06 | 完整 GEMM：多 stage 铺满 grid + Warp Spec + Cluster | §5 的 full/empty 双 barrier 骨架、§5.3 动态 smem |
+| cute_07 | Persistent Block / tile 调度 | §5 的流水线心智模型 |
 
 这三个后续章节正是 H200 五大特性（TMA、WGMMA、Warp Spec、Persistent、Cluster）
-的补全：本章已经实际跑通 TMA + WGMMA + multi-stage，Warp Spec 和 Persistent 在
-06/07 各自主场。
+的补全：本章已经实际跑通 TMA + multi-stage，WGMMA 在 05 接上，Warp Spec 和
+Persistent 在 06/07 各自主场。

@@ -12,7 +12,7 @@
 //   WGMMA  : 一个 warpgroup 发一条指令, 硬件直接读 smem 累加
 //   同步   : mbarrier (producer/consumer), 按字节数等
 //
-// 这一版 = cute_04 §6 跑通的单 CTA 多 stage, 铺满整个 grid。
+// 这一版 = cute_04 §5 跑通的单 CTA 多 stage, 铺满整个 grid。
 // cute_04 用的是手写 barrier + k&1 phase; 这一版用 cutlass::PipelineState
 // 的正式写法 —— 它是 CUTLASS 官方 wgmma_tma_sm90.cu 的结构。
 //
@@ -52,7 +52,7 @@ using namespace cute;
 //
 // 注意: 128x128x64 的 A 是 16KB, B 也是 16KB, 3 stage 就是 96KB > 48KB
 // 静态 smem 上限。所以这一版用 **extern __shared__ + cudaFuncSetAttribute**
-// (cute_04 §6.3 的台阶)。SharedStorage 结构体和官方 wgmma_tma_sm90.cu 一致。
+// (cute_04 §5.3 的台阶)。SharedStorage 结构体和官方 wgmma_tma_sm90.cu 一致。
 // ---------------------------------------------------------------------------
 constexpr int BM = 128, BN = 128, BK = 64;
 constexpr int NTHR = 128;
@@ -79,7 +79,7 @@ struct SharedStorage {
 //   write_state (producer): 等 consumer 的 barrier, 发 TMA, 通知 producer barrier
 //
 // 注意两个 PipelineState **都从 0 开始**, 不要在 prologue 里预推进 ——
-// 预推进会死锁 (cute_04 §6.2 的坑)。
+// 预推进会死锁 (cute_04 §5.2 的坑)。
 // ===========================================================================
 template <class TmaA, class TmaB, class SLA, class SLB>
 __global__ __launch_bounds__(NTHR) void gemm_tma_wgmma(

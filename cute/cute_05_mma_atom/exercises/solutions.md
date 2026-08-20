@@ -106,7 +106,7 @@ copy(tma_a.with(bar[0]), tAgA(_, 0), tAsA(_, Int<0>{}));
    第二次等 phase-1，第三次回到 phase-0……这就是"单缓冲 + phase bit"在裸 mbarrier
    上的样子。`k & 1` 只对 stage=2 起效；stage 更多要 `k % STAGES`（cute_06 v3 会做）。
 2. **每轮算完要 `__syncthreads()`**：等所有人都读完 smem，下一轮 TMA 才能覆盖。
-   这就是单缓冲的代价 —— 也正是 cute_04 §6 用多 stage 要消除的东西。
+   这就是单缓冲的代价 —— 也正是 cute_04 §5 用多 stage 要消除的东西。
 
 完整的 mainloop：
 

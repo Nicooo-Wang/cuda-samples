@@ -27,7 +27,7 @@
 //   §4.2  TMA 的五个硬性条件, 逐条对着代码看 (README §4.2)
 //   §4.3  多 K tile: 真实 GEMM 的 K 循环长什么样 (README §4.3)
 //
-// cute_04 §5 已经讲过 TMA 的机制本身 (descriptor 怎么建、tma_partition 干什么)。
+// cute_04 §2/§5 已经讲过 TMA 的机制本身 (descriptor 怎么建、mbarrier 怎么等)。
 // 这一版不重复那些, 只讲**它怎么接到 MMA 上**。
 //
 // 多卡机器上请指定一张空闲卡:  CUDA_VISIBLE_DEVICES=<idle> ./cute_mma_v2
@@ -176,7 +176,7 @@ static void run_manual_load() {
 // §4.1b / §4.2  有 TMA: 一个线程描述整块, 硬件搬
 //
 // 和上面那个 kernel 逐行对比, 变的只有搬运那几行。五个硬性条件都标在代码里
-// (完整解释见 cute_04 §5.2, 这里只标位置):
+// (完整解释见 cute_04 §2.1/§5.4, 这里只标位置):
 //
 //   条件 1: src 必须是 tma.get_tma_tensor(shape) 给出的**坐标** tensor
 //   条件 2: descriptor 必须在 host 用**真实设备指针**构造 (见 run_tma_load)
@@ -192,7 +192,7 @@ __global__ void gemm_tma_load(CUTLASS_GRID_CONSTANT TmaA const tma_a,
     __shared__ __align__(128) half_t rawB[cosize_v<SLay3>];
     __shared__ __align__(8) uint64_t bar[1];
 
-    // 条件 4: layout 带 PIPE mode。这里 PIPE=1 (单缓冲), 多 stage 是 cute_04 §6 的事
+    // 条件 4: layout 带 PIPE mode。这里 PIPE=1 (单缓冲), 多 stage 是 cute_04 §5 的事
     auto sA = make_tensor(make_smem_ptr(rawA), slay3);  // (BM,BK,1)
     auto sB = make_tensor(make_smem_ptr(rawB), slay3);
 
@@ -318,7 +318,7 @@ static void compare_paths() {
 
     printf("\n  但注意: 这一版**没有变快**, 因为搬和算仍然是串行的 ——\n");
     printf("    TMA 搬完 -> 等 -> WGMMA 算完 -> 等 -> 下一轮 TMA\n");
-    printf("  TMA 真正的价值要等它和多 stage 组合才兑现 (cute_04 §6 已跑通,\n");
+    printf("  TMA 真正的价值要等它和多 stage 组合才兑现 (cute_04 §5 已跑通,\n");
     printf("  cute_06 会把它铺满整个 grid)。这一节只证明「通路能换、换了对」。\n");
 }
 

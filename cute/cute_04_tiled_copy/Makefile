@@ -1,11 +1,11 @@
 NVCC      := nvcc
-# swizzle 本身 sm_80 就有, 但 GMMA::Layout_K_SW*_Atom 属于 sm_90 -> 统一用 sm_90a
 ARCH      := sm_90a
 CUTLASS_DIR := ../../third-party/cutlass
 NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo --extended-lambda \
              --expt-relaxed-constexpr -I$(CUTLASS_DIR)/include
 
-SRCS := cute_tiled_v0.cu cute_tiled_v1.cu cute_tiled_v2.cu cute_tiled_v3.cu cute_tiled_capstone.cu
+SRCS := cute_tiled_v0.cu cute_tiled_v1.cu cute_tiled_v2.cu cute_tiled_v3.cu \
+        cute_tiled_v4.cu cute_tiled_capstone.cu
 BINS := $(SRCS:.cu=)
 
 all: $(BINS)
@@ -14,19 +14,22 @@ all: $(BINS)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 run: all
-	@echo "========== v0: bank conflict 与 Swizzle 的映射机制 =========="
+	@echo "========== v0: 手写搬运基准 =========="
 	@./cute_tiled_v0
 	@echo ""
-	@echo "========== v1: 用 CuTe 语义做 Copy =========="
+	@echo "========== v1: TMA load + mbarrier =========="
 	@./cute_tiled_v1
 	@echo ""
-	@echo "========== v2: TMA —— 把搬运交给硬件 =========="
+	@echo "========== v2: TMA store + 边界 =========="
 	@./cute_tiled_v2
 	@echo ""
-	@echo "========== v3: Multi-stage —— 让搬运和计算重叠 =========="
+	@echo "========== v3: swizzle 与 smem 摆法 =========="
 	@./cute_tiled_v3
 	@echo ""
-	@echo "========== capstone: 矩阵转置 + TMA 版 =========="
+	@echo "========== v4: Multi-stage =========="
+	@./cute_tiled_v4
+	@echo ""
+	@echo "========== capstone: 转置 =========="
 	@./cute_tiled_capstone
 
 # 练习：题目见 README 的"练习"一节，答案填在 exercises/ex.cu 的 TODO 处

@@ -22,7 +22,7 @@
 //   warps 0-3  (wg0): consumer —— WGMMA
 //   warps 4-7  (wg1): producer —— TMA
 //
-// 注意两件事 (都是 cute_04 §6.4 踩过的坑):
+// 注意两件事 (都是 cute_04 §5 踩过的坑):
 //   - consumer 必须落在 wg0 (warps 0-3), producer 在 wg1。
 //     反过来 warpgroup_arrive/commit 会出问题。
 //   - producer 的 TMA 只能由 1 个 lane 发, 而且必须限定在 producer 组:

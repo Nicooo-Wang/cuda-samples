@@ -38,7 +38,7 @@ using namespace cute;
 //   4 个 warp 排成 2x2, 每个 warp 覆盖 32x32x16 (见 make_mma 的 Tile)。
 //   BK=64: cp.async 每轮搬 64x64 half, K 方向 4 步 (每步 BK=64)。
 //
-// smem layout: 用 Swizzle<3,3,3> 原子 (cute_04 §3 的 swizzle),
+// smem layout: 用 Swizzle<3,3,3> 原子 (cute_04 §4 的 swizzle),
 //   这里是为了让 ldmatrix 取数不撞 bank —— 不是给 WGMMA 用的。
 //
 // 每个 CTA: 128 线程 = 4 个 warp。
@@ -155,7 +155,7 @@ static void run(int M, int N, int K, bool verify) {
     CUDA_CHECK(cudaMemcpy(d_A, h_A, nA * sizeof(half_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B, nB * sizeof(half_t), cudaMemcpyHostToDevice));
 
-    // smem layout: 手写 swizzle 原子 (cute_04 §3), 不是 GMMA —— 这里没有 WGMMA
+    // smem layout: 手写 swizzle 原子 (cute_04 §4), 不是 GMMA —— 这里没有 WGMMA
     auto swizzle_atom = composition(Swizzle<3, 3, 3>{},
                                     Layout<Shape<_8, Shape<_8, _8>>,
                                            Stride<_8, Stride<_1, _64>>>{});
