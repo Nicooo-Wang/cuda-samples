@@ -81,10 +81,10 @@ tile 越大（K 越长），这个成本摊得越薄。
 
 ```
 512x512x512:    0.014 ms   19.4 TFLOP/s   (和 cute_06 v3 差不多)
-2048x2048x2048: 0.055 ms  312.8 TFLOP/s
+2048x2048x2048: 0.055 ms  312.5 TFLOP/s
 ```
 
-和 v3（429 TFLOP/s）比略低 —— 因为 grid=132 < v3 的 grid=256，每 CTA 的 tile
+和 v3（421 TFLOP/s）比略低 —— 因为 grid=132 < v3 的 grid=256，每 CTA 的 tile
 更多，加上每 tile 的 barrier 重置。**persistent 不是免费的**，它的价值在调度权。
 
 ---
@@ -116,11 +116,11 @@ row-major:                     swizzled (块大小 4):
 ### §2.3 实测（诚实的）
 
 ```
-2048 row-major  312.6 TFLOP/s
+2048 row-major  311.7 TFLOP/s
 2048 swizzled   308.6 TFLOP/s   ← 没差别
 ```
 
-为什么没差别？**A+B = 16MB，L2 = 60MB** —— 全部装得下，怎么调度都命中。
+为什么没差别？**A+B = 17MB，L2 = 63MB** —— 全部装得下，怎么调度都命中。
 rasterization 只有在 **A+B >> L2** 时才可能有用（见 capstone 的 8192 实测，
 以及那里更诚实的结论）。
 
@@ -131,8 +131,8 @@ rasterization 只有在 **A+B >> L2** 时才可能有用（见 capstone 的 8192
 跑 `cute_gemm_capstone.cu`。固定 persistent + 两种调度，扫多个尺寸。
 
 ```
-L2 = 60 MB (本机)
-2048^3: A+B = 16 MB  < L2 -> 调度无所谓
+L2 = 63 MB (本机)
+2048^3: A+B = 17 MB  < L2 -> 调度无所谓
 4096^3: A+B = 67 MB  ~= L2 -> 临界
 8192^3: A+B = 268 MB > L2 -> 理论上有调度空间
 ```
@@ -140,8 +140,8 @@ L2 = 60 MB (本机)
 ### §3.3 诚实的实测结论
 
 ```
-2048 row-major  312.6 TFLOP/s    2048 swizzled  308.6
-8192 row-major  271   TFLOP/s    8192 swizzled  266
+2048 row-major  313.4 TFLOP/s    2048 swizzled  307.1
+8192 row-major  273.4 TFLOP/s    8192 swizzled  265.8
 ```
 
 **简化 swizzle 没赢过 row-major**。三个原因，都是真实工程：

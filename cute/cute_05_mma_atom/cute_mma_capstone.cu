@@ -254,7 +254,7 @@ int main() {
     printf("    v0 的 fragment 概念 + v1 的 WGMMA 四句 + v2 的 TMA 通路\n");
     printf("    再加上 grid 那一层 blockIdx -> 每个 CTA 一块 C\n");
 
-    printf("\n  但它离 cuBLAS (本机 4096^3 实测约 878 TFLOP/s) 还差得远, 原因有三个,\n");
+    printf("\n  但它离 cuBLAS (本机 4096^3 实测约 805 TFLOP/s) 还差得远, 原因有三个,\n");
     printf("  每一个都是 cute_06 的一节:\n");
     printf("    1. **没有流水线**: 搬完才算, 算完才搬, 两个引擎各闲一半。\n");
     printf("       -> cute_06 v3: 多 stage + PipelineState (cute_04 §5 已跑通骨架)\n");

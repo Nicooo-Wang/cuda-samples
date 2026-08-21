@@ -261,7 +261,7 @@ int main() {
     run(2048, 2048, 2048, false);
 
     print_separator("小结");
-    printf("  v2 (cp.async 3-stage) 2048^3: ~70 TFLOP/s\n");
+    printf("  v2 (cp.async 3-stage) 2048^3: ~71 TFLOP/s\n");
     printf("  v3 (TMA+WGMMA)        2048^3: 看上面打印\n");
     printf("  快在哪: TMA 不占指令流/寄存器, WGMMA 一次算 64x64,\n");
     printf("          mbarrier 让同步粒度从全 block 变成按 stage。\n");

@@ -7,10 +7,10 @@
 //
 //   **rasterization 到底什么时候有用?**
 //
-// 答案在 L2 容量上。本机 L2 = 60 MB:
-//   - 2048^3: A+B = 2 * 2048*2048*2B = 16 MB  < 60 MB -> 全部能装进 L2,
-//     怎么调度都一样 (v1 实测 311 vs 309, 就是证据)。
-//   - 8192^3: A+B = 256 MB >> 60 MB -> L2 装不下, 调度决定 L2 命中率。
+// 答案在 L2 容量上。本机 L2 = 63 MB:
+//   - 2048^3: A+B = 2 * 2048*2048*2B = 17 MB  < 63 MB -> 全部能装进 L2,
+//     怎么调度都一样 (v1 实测 312 vs 309, 就是证据)。
+//   - 8192^3: A+B = 268 MB >> 63 MB -> L2 装不下, 调度决定 L2 命中率。
 //
 // 所以这一版: 固定 persistent + 两种调度, 扫多个尺寸, 让你亲眼看到
 // "小矩阵没差别, 大矩阵有差别" 这条曲线。
@@ -54,6 +54,9 @@ struct SharedStorage {
 };
 
 // 两种调度: 0 = row-major, 1 = swizzled (块大小 4)
+// swizzled 分支要求 num_tiles_m % SWIZ == 0, 由 host 的 check_swizzle_ok() 保证。
+// 不整除时把越界的 by 钳到最后一行是**错的** (部分 tile 算两遍、部分永不算,
+// 结果静默错), 所以这里既不钳位也不放 device assert (后者会拖慢主循环)。
 CUTE_HOST_DEVICE static void tile_coord(int tile_id, int num_tiles_m, int num_tiles_n, int mode,
                                        int& by, int& bx) {
     constexpr int SWIZ = 4;
@@ -65,8 +68,17 @@ CUTE_HOST_DEVICE static void tile_coord(int tile_id, int num_tiles_m, int num_ti
         int within = tile_id % SWIZ;
         by = (group / num_tiles_n) * SWIZ + within;
         bx = group % num_tiles_n;
-        if (by >= num_tiles_m) by = num_tiles_m - 1;
     }
+}
+
+// host 侧前提检查
+static bool check_swizzle_ok(int num_tiles_m, int mode) {
+    if (mode == 0) return true;
+    if (num_tiles_m % 4 != 0) {
+        printf("  [跳过] swizzled 要求 num_tiles_m(%d) 能被 4 整除\n", num_tiles_m);
+        return false;
+    }
+    return true;
 }
 
 // ===========================================================================
@@ -169,8 +181,9 @@ __global__ __launch_bounds__(NTHR) void gemm_persistent(
 // ===========================================================================
 // §3.2  验证 + 计时 (带 L2 分析)
 // ===========================================================================
-static void run(int M, int N, int K, bool verify, int num_sms, int mode, const char* tag,
-                int iters = 20) {
+// 返回实测 TFLOP/s —— 小结里直接用它, 不再用硬编码的 ms 反算
+static double run(int M, int N, int K, bool verify, int num_sms, int mode, const char* tag,
+                  int iters = 20) {
     size_t nA = size_t(M) * K, nB = size_t(N) * K, nC = size_t(M) * N;
 
     half_t *h_A = new half_t[nA], *h_B = new half_t[nB];
@@ -209,6 +222,7 @@ static void run(int M, int N, int K, bool verify, int num_sms, int mode, const c
                                     smem_bytes));
 
     int num_tiles_m = M / BM, num_tiles_n = N / BN;
+    if (!check_swizzle_ok(num_tiles_m, mode)) return 0.0;
     dim3 grid(num_sms), block(NTHR);
     auto launch = [&] {
         gemm_persistent<<<grid, block, smem_bytes>>>(tma_a, tma_b, d_C, M, N, K, num_tiles_m,
@@ -236,6 +250,7 @@ static void run(int M, int N, int K, bool verify, int num_sms, int mode, const c
     delete[] h_B;
     delete[] h_C;
     delete[] h_ref;
+    return tf;
 }
 
 // ===========================================================================
@@ -259,15 +274,15 @@ int main() {
         double ab = 2.0 * sz * sz * 2 / 1e6;
         printf("  %-16d %-20.1f %-10s\n", sz, ab, ab < l2_mb ? "是" : "否");
     }
-    printf("\n  2048^3: A+B = 16 MB  < L2 -> 调度无所谓\n");
-    printf("  8192^3: A+B = 256 MB > L2 -> 调度决定 L2 命中率\n");
+    printf("\n  2048^3: A+B = 17 MB  < L2 -> 调度无所谓\n");
+    printf("  8192^3: A+B = 268 MB > L2 -> 调度决定 L2 命中率\n");
 
     print_separator("§3.3  实测: 两种调度 × 两种尺寸");
     printf("\n  (8192^3 慢, 耐心等)\n");
     run(2048, 2048, 2048, false, num_sms, 0, "2048 row-major");
     run(2048, 2048, 2048, false, num_sms, 1, "2048 swizzled");
-    run(8192, 8192, 1024, false, num_sms, 0, "8192 row-major", 8);
-    run(8192, 8192, 1024, false, num_sms, 1, "8192 swizzled", 8);
+    double tf8_rm = run(8192, 8192, 1024, false, num_sms, 0, "8192 row-major", 8);
+    double tf8_sw = run(8192, 8192, 1024, false, num_sms, 1, "8192 swizzled", 8);
 
     print_separator("小结 —— 诚实的结论");
     printf("  persistent 的价值: grid = SM 数, CTA 循环吃 tile, 调度权在手。\n");
@@ -275,8 +290,8 @@ int main() {
     printf("    - 132 CTA 吃 4096 个 tile, 每 CTA ~31 个, 负载均衡波动 > L2 收益\n");
     printf("    - 简化 swizzle 只聚了 M 方向 4 个 tile, 2D 空间局部性远不如\n");
     printf("      CUTLASS 的 bit-reversal + tile-block 调度 (那是几百行代码)\n");
-    printf("    - 8192 时 row-major %.0f vs swizzled %.0f, 差距在噪声内\n",
-           gemm_tflops(8192, 8192, 1024, 0.508f), gemm_tflops(8192, 8192, 1024, 0.516f));
+    printf("    - 8192 时 row-major %.0f vs swizzled %.0f, 差距在噪声内 (本次实跑值)\n",
+           tf8_rm, tf8_sw);
     printf("  所以正确的结论:\n");
     printf("    1. persistent 结构是 CUTLASS/cuBLAS 的标准 (grid = SM 数)\n");
     printf("    2. rasterization 的收益要在 CUTLASS 级的调度复杂度下才兑现\n");

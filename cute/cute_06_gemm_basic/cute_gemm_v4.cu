@@ -256,7 +256,7 @@ int main() {
     run(2048, 2048, 2048, false);
 
     print_separator("小结");
-    printf("  v3 (128 线程, 又搬又算) 2048^3: ~430 TFLOP/s\n");
+    printf("  v3 (128 线程, 又搬又算) 2048^3: ~421 TFLOP/s\n");
     printf("  v4 (WS, 256 线程分工)   2048^3: 看上面打印 (诚实说: 未必更快)\n");
     printf("\n  为什么手写最小 WS 不一定会赢?\n");
     printf("    1. 256 线程 = 2 个 warpgroup 挤一个 SM, 占用率降了\n");

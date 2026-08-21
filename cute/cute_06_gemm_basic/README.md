@@ -28,7 +28,7 @@ v3  TMA+WGMMA     Hopper 流水线: 两个硬件异步引擎     (+6x)
 v4  Warp Spec     producer 只搬 / consumer 只算        (诚实的: 未必更快)
 capstone cluster  把 CTA 组成小队                       (诚实的: 未必更快)
                     ──
-cuBLAS 参考        ~878 TFLOP/s (2048^3 本机实测)
+cuBLAS 参考        ~540 TFLOP/s (2048^3 本机实测; 4096^3 约 805)
 ```
 
 > 数字都是本机（H200, sm_90a）实测。v0 到 v3 是巨大的台阶，v4 和 capstone
@@ -170,7 +170,8 @@ mainloop (双 state 独立转):
 注意 128×128×64 × 3 stage = 96KB > 48KB 静态上限，所以用 `extern __shared__` +
 `cudaFuncSetAttribute`（cute_04 §5.3 的台阶）。
 
-实测（2048³）：**~428 TFLOP/s** —— 比 v2 快 **6×**。这就是 Hopper 的兑现。
+实测（2048³）：**~421 TFLOP/s** —— 比 v2 快 **6×**。这就是 Hopper 的兑现。
+对照同尺寸的 cuBLAS（~540），这一版已经到它的 **78%**。
 
 ---
 
@@ -199,7 +200,7 @@ Warp Specialization 的答案：**把线程分成两组，各干各的**。
 
 ### §5.3 诚实的实测
 
-手写最小 WS（2048³）：**~393 TFLOP/s**，比 v3（428）**慢**。
+手写最小 WS（2048³）：**~391 TFLOP/s**，比 v3（421）**慢**。
 
 为什么？三个原因，都是真实工程：
 
@@ -245,18 +246,45 @@ cute::cluster_sync();                                // 全 cluster 栅栏
 
 **原理**：在 2×2 cluster 里，同一行（cy 相同）的两个 CTA 读**同一块 A**，
 同一列的两个读同一块 B。非 multicast 时每个 CTA 各搬各的，A 的 gmem/L2 流量
-是 2 倍。TMA multicast 让一个 CTA 发一次，硬件把同一块数据同时写进多个
-CTA 的 smem —— gmem 只读一次。
+是 2 倍。TMA multicast 让硬件把同一块数据同时写进多个 CTA 的 smem —— gmem 只读一次。
 
-**为什么这一版没上**：hand-rolled multicast 需要 TMA TiledCopy 的全套 machinery
-（`make_tma_copy` + `get_slice` + `partition_S/D`），很容易在 rank/坐标上出错，
-是 CUTLASS `sm90_mma_tma_gmma_ss_warpspecialized.hpp` 几百行的活。
-这一版先把 cluster 机制讲干净，multicast 的原理和它在 CUTLASS 里的用法
-见上面的官方文件。
+**API 其实很短**（这不是没上的原因）。和普通 TMA 比只差三处：
+
+```cpp
+// host: atom 换成 MULTICAST, 多传一个 cluster 形状
+auto tma_a = make_tma_atom(SM90_TMA_LOAD_MULTICAST{}, mA, sla(_,_,_0{}),
+                           make_shape(_128{}, _64{}), Int<2>{});   // ← cluster 大小
+// kernel: partition 时告诉它"我是 cluster 里第几个"
+auto [tAgA, tAsA] = tma_partition(tma_a, cta_rank, make_layout(Int<2>{}), sA_x, gA_zd);
+// kernel: copy 时多一个 mask —— 第 i 位 = 1 表示"数据也送进第 i 个 CTA"
+uint16_t mask = (uint16_t(1) << 2) - 1;
+copy(tma_a.with(bar, mask), tAgA(_,k), tAsA(_,s));
+```
+
+**真正难的是同步语义**，有一条反直觉的规则：
+
+> 一条 multicast TMA 的**完成信号（complete_tx）只到达发起者的 mbarrier**，
+> 数据却写进 mask 内**所有** CTA 的 smem。
+
+于是"一个 CTA 发、其他 CTA 等"是**死锁**：别的 CTA 的 mbarrier 上永远没有
+complete。可行的做法只有两类，各有各的坑：
+
+| 做法 | 代价 |
+|---|---|
+| 每个 CTA 各发一条（数据重复） | 多条 TMA 写同一片 smem，坐标必须完全一致才不 race；`expect_tx` 的字节数要跟着改 |
+| 一个 CTA 发 + `cluster_sync` 广播 | 每个 k-tile 多一次全 cluster 栅栏，和多 stage 流水线的 stage 复用打架 |
+
+把这两点和 producer/consumer 双 barrier、stage 轮转组合起来，就是 CUTLASS
+`sm90_mma_tma_gmma_ss_warpspecialized.hpp` 里 `PipelineTmaAsync` 存在的理由。
+**这一章到 cluster 机制为止**；multicast 的完整流水线版本请直接读那个文件。
+
+> 顺带一提：cluster launch 有个静默的坑 —— `grid` 的**每一维都必须是 cluster
+> 对应维的整数倍**，否则 `launch_kernel_on_cluster` 返回 `kInvalid` 而 kernel
+> 根本不启动（`block_rank_in_cluster()` 全是 0，数据全空）。它的返回值一定要检查。
 
 ### §6.3 诚实的实测
 
-cluster 版（2048³）：**~290 TFLOP/s**，比 v3（428）慢。因为 4 个 CTA 挤一个
+cluster 版（2048³）：**~290 TFLOP/s**，比 v3（421）慢。因为 4 个 CTA 挤一个
 SM 争抢资源，tile 又小。**cluster 不是免费的** —— 它的价值在 multicast 和
 跨 CTA 协作（例如 fp8 的 scale 交换、split-K 的归约），不是单跑变快。
 
@@ -266,11 +294,11 @@ SM 争抢资源，tile 又小。**cluster 不是免费的** —— 它的价值�
  版本                         TFLOP/s (2048^3)
  v0 naive                      ~11.7
  v1 smem 单缓冲                ~66.9
- v2 cp.async 3-stage           ~70.6
- v3 TMA+WGMMA 3-stage          ~428
- v4 Warp Spec (手写最小)       ~393
+ v2 cp.async 3-stage           ~70.7
+ v3 TMA+WGMMA 3-stage          ~421     <- cuBLAS 同尺寸的 78%
+ v4 Warp Spec (手写最小)       ~391
  capstone cluster              ~290
- cuBLAS fp16 (参考)            ~878
+ cuBLAS fp16 (参考)            ~540
 ```
 
 ### 为什么追不上 cuBLAS（以及为什么正常）

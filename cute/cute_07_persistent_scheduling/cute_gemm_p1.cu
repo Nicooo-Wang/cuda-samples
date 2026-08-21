@@ -76,6 +76,11 @@ struct SharedStorage {
 // swizzled: 把 num_tiles_m x num_tiles_n 的网格按 SWIZ 个 tile 一列一组,
 // 组内按 (row-major), 组间按列交错。这是 CUTLASS 的 swizzled rasterization
 // 的简化版 (完整的用 bit 反转, 这里用按块分组演示概念)。
+//
+// 前提: num_tiles_m 必须能被 SWIZ 整除, 由 host 侧的 check_swizzle_ok() 保证。
+// 不整除时 by 会越界, 而"把越界的 by 钳到最后一行"是**错的** —— 那样有的 tile
+// 被算两遍、有的永远不算, 结果静默错。所以这里不加钳位 (也不加 device assert:
+// 它会拖慢主循环), 而是在 host 侧提前挡住。
 CUTE_HOST_DEVICE static void tile_coord(int tile_id, int num_tiles_m, int num_tiles_n, int mode, int& by,
                        int& bx) {
     constexpr int SWIZ = 4;  // 每块含 SWIZ 个 tile (演示用)
@@ -92,9 +97,17 @@ CUTE_HOST_DEVICE static void tile_coord(int tile_id, int num_tiles_m, int num_ti
         // 组内 SWIZ 个 tile 沿 M 方向排 (同一列, 不同行)
         by = group_row * SWIZ + within;
         bx = group_col;
-        // 边界保护 (tile 数不是 SWIZ 的整数倍时)
-        if (by >= num_tiles_m) { by = num_tiles_m - 1; }
     }
+}
+
+// host 侧的前提检查: swizzled 调度要求 M 方向的 tile 数是 SWIZ 的整数倍
+static bool check_swizzle_ok(int num_tiles_m, int mode) {
+    if (mode == 0) return true;
+    if (num_tiles_m % 4 != 0) {
+        printf("  [跳过] swizzled 调度要求 num_tiles_m(%d) 能被 4 整除\n", num_tiles_m);
+        return false;
+    }
+    return true;
 }
 
 // 打印映射表 (host 侧)
@@ -247,6 +260,7 @@ static void run(int M, int N, int K, bool verify, int num_sms, int mode) {
                                     smem_bytes));
 
     int num_tiles_m = M / BM, num_tiles_n = N / BN;
+    if (!check_swizzle_ok(num_tiles_m, mode)) return;
     dim3 grid(num_sms), block(NTHR);
     auto launch = [&] {
         gemm_persistent<<<grid, block, smem_bytes>>>(tma_a, tma_b, d_C, M, N, K, num_tiles_m,

@@ -13,10 +13,19 @@
 // 但 cluster 机制完整保留 —— block_rank_in_cluster / cluster_sync /
 // 按 cluster 排布的 grid。
 //
-// 为什么不直接上 multicast? 因为 hand-rolled multicast 需要 TMA TiledCopy 的
-// 全套 machinery (make_tma_copy + get_slice + partition_S/D), 那是 CUTLASS
-// sm90_mma_tma_gmma_ss_warpspecialized.hpp 的几百行。这一版先把 cluster 机制
-// 讲干净, multicast 的原理和它在 CUTLASS 里的用法见 README §6.2。
+// 为什么不直接上 multicast? 不是因为 API 长 —— API 只差三处 (atom 换成
+// SM90_TMA_LOAD_MULTICAST + 多传 cluster 形状、tma_partition 传 cta_rank、
+// copy 多一个 mask)。难的是**同步语义**:
+//
+//   一条 multicast TMA 的完成信号 (complete_tx) 只到达**发起者**的 mbarrier,
+//   数据却写进 mask 内**所有** CTA 的 smem。
+//
+// 所以"一个 CTA 发、其他 CTA 等"是死锁 (别人的 barrier 上没有 complete)。
+// 可行的做法要么每个 CTA 各发一条 (坐标必须完全一致才不 race, expect_tx 也要
+// 跟着改), 要么用 cluster_sync 广播完成 (每个 k-tile 多一次全 cluster 栅栏)。
+// 两者和多 stage 的 stage 轮转、producer/consumer 双 barrier 组合起来都很容易错
+// —— 这正是 CUTLASS sm90_mma_tma_gmma_ss_warpspecialized.hpp 里 PipelineTmaAsync
+// 存在的理由。这一版先把 cluster 机制讲干净, multicast 见 README §6.2 和该文件。
 //
 //   §6.1  cluster 机制: 怎么启动、怎么同步       (README §6.1)
 //   §6.2  multicast: 原理 + 为什么留给 CUTLASS   (README §6.2)
@@ -218,8 +227,16 @@ static void run(int M, int N, int K, bool verify) {
     cutlass::ClusterLaunchParams params{grid, block, cluster_dims, int(smem_bytes)};
     void const* kptr_v = reinterpret_cast<void const*>(kptr);
 
+    // 注意这个返回值一定要看: grid 的每一维必须是 cluster 对应维的整数倍,
+    // 否则这里返回 kInvalid 而 kernel **根本不启动** —— 不检查的话表现是
+    // "结果全错/全 0" 而不是报错, 很难查。
     auto launch = [&] {
-        cutlass::launch_kernel_on_cluster(params, kptr_v, tma_a, tma_b, d_C, M, N, K, sla, slb);
+        auto st = cutlass::launch_kernel_on_cluster(params, kptr_v, tma_a, tma_b, d_C, M, N, K,
+                                                    sla, slb);
+        if (st != cutlass::Status::kSuccess) {
+            printf("  cluster launch 失败 (status=%d): grid (%d,%d) 必须是 cluster (%d,%d) 的整数倍\n",
+                   int(st), grid.x, grid.y, cluster_dims.x, cluster_dims.y);
+        }
     };
 
     launch();
@@ -261,11 +278,11 @@ int main() {
     printf("\n  %-30s %12s\n", "版本", "TFLOP/s (2048^3)");
     printf("  %-30s %12s\n", "v0 naive", "~11.7");
     printf("  %-30s %12s\n", "v1 smem 单缓冲", "~66.9");
-    printf("  %-30s %12s\n", "v2 cp.async 3-stage", "~70.6");
-    printf("  %-30s %12s\n", "v3 TMA+WGMMA 3-stage", "~428");
-    printf("  %-30s %12s\n", "v4 Warp Spec (手写最小)", "~393");
+    printf("  %-30s %12s\n", "v2 cp.async 3-stage", "~70.7");
+    printf("  %-30s %12s\n", "v3 TMA+WGMMA 3-stage", "~421");
+    printf("  %-30s %12s\n", "v4 Warp Spec (手写最小)", "~391");
     printf("  %-30s %12s\n", "capstone cluster", "看上面打印");
-    printf("  %-30s %12s\n", "cuBLAS fp16 (参考)", "~878");
+    printf("  %-30s %12s\n", "cuBLAS fp16 (参考)", "~540");
 
     print_separator("诚实总结 —— 差在哪, 还差多少");
     printf("  手写 GEMM 追不上 cuBLAS 是**正常的**, 不是没学会。差在:\n");

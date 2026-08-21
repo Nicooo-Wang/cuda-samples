@@ -300,12 +300,12 @@ v0 §2.3 我们给 SM80 原子加 `Layout<Shape<_2,_2,_1>>` 拼出更大 tile。
 
 ```
 §5.2 正确性: 256³ / 512x256x512 和 CPU 逐点比, bad=0
-§5.3 吞吐  : 4096³ 约 350~400 TFLOP/s (无流水线, 具体以你机器打印为准)
+§5.3 吞吐  : 4096³ 约 400~410 TFLOP/s (无流水线, 具体以你机器打印为准)
 ```
 
-### §5.3 为什么离 cuBLAS 还远
+### §5.4 为什么离 cuBLAS 还远
 
-本机 cuBLAS FP16 `4096³` 实测 ~878 TFLOP/s（~89% 峰值），capstone 只有它的一半上下。
+本机 cuBLAS FP16 `4096³` 实测 ~805 TFLOP/s，capstone（~410）是它的一半左右。
 三个原因，每个都是 cute_06 的一节：
 
 | 差距 | 原因 | cute_06 解法 |
@@ -350,7 +350,7 @@ cute_05_mma_atom/
 
 **下一步 (cute_06)**：capstone 只剩没做重叠。cute_06 从 naive 一路上来——
 v0 naive GEMM → v1 smem → v2 多 stage `cp.async` → **v3 TMA+WGMMA 多 stage
-（cute_04 §5 骨架铺满 grid）** → **v4 Warp Specialization** → v5 Block Cluster。
+（cute_04 §5 骨架铺满 grid）** → **v4 Warp Specialization** → capstone Block Cluster。
 终端是对标 cuBLAS。你已经拿到全部零件，cute_06 是把它们拧成一台机器。
 
 ---
