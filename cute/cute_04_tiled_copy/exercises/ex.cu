@@ -188,8 +188,7 @@ static void ex6() {
     // TODO: 转置结果正确但列读 32-way。只改 slay 一行, 让列读 <= 16-way。
     // (用 §4.6 的 SW128 原子)
     // TODO 提示: tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, ...)
-    auto slay = plain();  // <-- 改成 SW128 的
-    auto swz = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, make_shape(Int<32>{}, Int<32>{}));
+    auto swz = tile_to_shape(GMMA::Layout_K_SW32_Atom<float>{}, make_shape(Int<32>{}, Int<32>{}));
     constexpr int M = 256, N = 128;
     float *da, *db;
     CUDA_CHECK(cudaMalloc(&da, sizeof(float) * M * N));
@@ -216,7 +215,7 @@ static void ex6() {
 template <class TmaLoad>
 __global__ void tma_load_kernel(__grid_constant__ const TmaLoad tma, float* __restrict__ out) {
     // TODO 1: 这一次搬多少字节? (填错/填 0 的结果: barrier 立即放行, 数据没搬)
-    constexpr int tx_bytes = 0;  // <-- 32*32*sizeof(float)
+    constexpr int tx_bytes = 32 * 32 * sizeof(float);  // <-- 32*32*sizeof(float)
 
     // TODO 2: smem (128B 对齐) 和 mbarrier
     __shared__ __align__(128) float smem[32 * 32];  // <-- TODO: 32*32
