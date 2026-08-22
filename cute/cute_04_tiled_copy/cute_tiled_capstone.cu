@@ -24,12 +24,20 @@
 //   输出:  B 是 N x M 的 float, row-major, B(n,m) = A(m,n)
 //
 //   每个 CTA 负责 A 的一个 CM x CN 的 tile:
-//     1) TMA load 搬进 smem
+//     1) (TMA) load 搬进 smem
 //     2) 转置着读出来 (读 smem 的"行" -> 写 gmem 的"列", 这就是按列读)
-//     3) TMA store 搬回 gmem 的对应位置
+//     3) (TMA) store 搬回 gmem 的对应位置
 //
 //   A[m, n] = m*N + n        B 的正确值: B[n, m] = m*N + n
 //
+// ---------------------------------------------------------------------------
+// 阅读方式 (与 cute_03 capstone 相同)
+//
+// 每个版本都是「一个 kernel + 紧跟其后的一个 host 函数」。host 函数自带这一版
+// 需要的全部东西: 缓冲区、Tensor、layout、TMA descriptor、launch、验证。
+// 从上往下顺读即可, 不需要跳到别处找参数是怎么来的。
+//
+// main 只做一件事: 按顺序调这六个 run_*, 每个 run_* 自己打印自己那一行。
 // ---------------------------------------------------------------------------
 //
 // 多卡机器上请指定一张空闲卡:  CUDA_VISIBLE_DEVICES=<idle> ./cute_tiled_capstone
@@ -52,7 +60,7 @@ constexpr int NTHR = 128;
 static dim3 grid() { return dim3(M / CM, N / CN); }
 
 // ---------------------------------------------------------------------------
-// 缓冲区: 一个 A, 一个 B
+// 缓冲区: 一个 A, 一个 B (每个 run_* 自己拿一份, 干净互不干扰)
 // ---------------------------------------------------------------------------
 struct Buffers {
     static constexpr size_t elems = size_t(M) * N;
@@ -90,7 +98,15 @@ struct Buffers {
     }
 };
 
-// 读 smem 时的列冲突 (每列扫描取最坏)
+// 每个 run_* 的返回: 名字 / 列读冲突数 / 是否正确, main 用来做小结。
+// conflict = 0 表示没有手写读 smem (t6 由 TMA 硬件读), 打印时显示 "—"。
+struct Result {
+    const char* name;
+    int conflict;
+    bool ok;
+};
+
+// 读 smem 时的列冲突 (每列扫描取最坏) —— 转置按列读, 冲突全挤在这一步
 template <class Lay>
 static int worst_col_conflict(Lay lay) {
     int worst = 0;
@@ -102,13 +118,14 @@ static int worst_col_conflict(Lay lay) {
 }
 
 // ===========================================================================
-// 版本 A: 手写搬运 (v0 的写法), 转置在 smem 和 gmem 之间完成
+// Example t1 —— 手写搬运 + plain smem (v0 的写法, 32-way 冲突的起点)
 //
 // 读 smem 时 "sT(行 = lane, 列 = r)" —— 32 个 lane 读同一列 -> 撞 bank。
+// 整个文件里唯一没有 TMA 的版本, 作全场的基准。
 // ===========================================================================
 template <class SLay>
-__global__ static void transpose_hand_kernel(const float* __restrict__ a, float* __restrict__ b,
-                                             SLay slay) {
+__global__ static void transpose_t1_kernel(const float* __restrict__ a, float* __restrict__ b,
+                                           SLay slay) {
     extern __shared__ __align__(128) char raw[];
     auto sT = make_tensor(make_smem_ptr(reinterpret_cast<float*>(raw)), slay);
 
@@ -127,12 +144,72 @@ __global__ static void transpose_hand_kernel(const float* __restrict__ a, float*
     }
 }
 
+static Result run_t1() {
+    print_separator("t1  手写 + plain smem");
+
+    Buffers buf;
+    auto plain = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+
+    int conflict = worst_col_conflict(plain);
+    transpose_t1_kernel<<<grid(), NTHR, cosize_v<decltype(plain)> * sizeof(float)>>>(
+        buf.d_a, buf.d_b, plain);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    bool ok = buf.check();
+    printf("  %-34s 列读 %2d-way   %s\n", "t1  手写 + plain smem", conflict, ok ? "正确" : "错误");
+    return {"t1  手写 + plain smem", conflict, ok};
+}
+
 // ===========================================================================
-// 版本 B: TMA load + 手写 store (v1/v3 的写法)
+// Example t2 —— 手写搬运 + SW128 smem
+//
+// 和 t1 相比只换了一件事: smem 的摆法从 plain 换成 SW128。
+// kernel 一字不改 —— swizzle 是逻辑层重排 (§4.3), 手写搬运同样吃红利。
+// ===========================================================================
+template <class SLay>
+__global__ static void transpose_t2_kernel(const float* __restrict__ a, float* __restrict__ b,
+                                           SLay slay) {
+    extern __shared__ __align__(128) char raw[];
+    auto sT = make_tensor(make_smem_ptr(reinterpret_cast<float*>(raw)), slay);
+
+    const int row0 = blockIdx.x * CM, col0 = blockIdx.y * CN;
+
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x)
+        sT(i / CN, i % CN) = a[(row0 + i / CN) * N + (col0 + i % CN)];
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) {
+        int r = i / CN;
+        int c = i % CN;
+        b[(col0 + r) * M + (row0 + c)] = sT(c, r);
+    }
+}
+
+static Result run_t2() {
+    print_separator("t2  手写 + SW128 smem");
+
+    Buffers buf;
+    auto swz = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, make_shape(Int<CM>{}, Int<CN>{}));
+
+    int conflict = worst_col_conflict(swz);
+    transpose_t2_kernel<<<grid(), NTHR, cosize_v<decltype(swz)> * sizeof(float)>>>(
+        buf.d_a, buf.d_b, swz);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    bool ok = buf.check();
+    printf("  %-34s 列读 %2d-way   %s\n", "t2  手写 + SW128 smem", conflict, ok ? "正确" : "错误");
+    return {"t2  手写 + SW128 smem", conflict, ok};
+}
+
+// ===========================================================================
+// Example t3 —— TMA load + plain smem (v1/v3 的写法)
+//
+// 搬运换成硬件: 一个线程发一条 cp.async.bulk, 整个 tile 由 TMA 搬进 smem,
+// mbarrier 等它落地。后面的手写转置和 t1 一字不差。
 // ===========================================================================
 template <class SLay, class TmaLoad>
-__global__ static void transpose_tma_kernel(__grid_constant__ const TmaLoad tma, SLay slay,
-                                            float* __restrict__ b) {
+__global__ static void transpose_t3_kernel(__grid_constant__ const TmaLoad tma, SLay slay,
+                                           float* __restrict__ b) {
     constexpr int tx_bytes = CM * CN * sizeof(float);
     extern __shared__ __align__(128) char raw[];
     __shared__ uint64_t bar;
@@ -159,10 +236,83 @@ __global__ static void transpose_tma_kernel(__grid_constant__ const TmaLoad tma,
     }
 }
 
+static Result run_t3() {
+    print_separator("t3  TMA load + plain smem");
+
+    Buffers buf;
+    auto plain = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
+    auto mA = make_tensor(make_gmem_ptr(buf.d_a),
+                          make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
+    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mA, plain);
+
+    int conflict = worst_col_conflict(plain);
+    transpose_t3_kernel<<<grid(), NTHR, cosize_v<decltype(plain)> * sizeof(float)>>>(
+        tma, plain, buf.d_b);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    bool ok = buf.check();
+    printf("  %-34s 列读 %2d-way   %s\n", "t3  TMA load + plain smem", conflict, ok ? "正确" : "错误");
+    return {"t3  TMA load + plain smem", conflict, ok};
+}
+
 // ===========================================================================
-// 版本 C: TMA load + TMA store (本章终点, §3.2 的完整版)
+// Example t4 —— TMA load + SW128 smem (本章主线, §4 的写法)
 //
-// 转置怎么做? 这里有两个选择, 本章用**手写转置 + TMA store**:
+// 和 t3 相比还是只换 smem 摆法。注意 swizzle 不再由我们写进 kernel:
+// 它被编码在 TMA descriptor 里, 硬件搬进 smem 时就已经是 swizzle 后的样子。
+// ===========================================================================
+template <class SLay, class TmaLoad>
+__global__ static void transpose_t4_kernel(__grid_constant__ const TmaLoad tma, SLay slay,
+                                           float* __restrict__ b) {
+    constexpr int tx_bytes = CM * CN * sizeof(float);
+    extern __shared__ __align__(128) char raw[];
+    __shared__ uint64_t bar;
+
+    auto sT = make_tensor(make_smem_ptr(reinterpret_cast<float*>(raw)), slay);
+
+    auto gc = tma.get_tma_tensor(make_shape(Int<M>{}, Int<N>{}));
+    auto gt = local_tile(gc, Shape<Int<CM>, Int<CN>>{}, make_coord(blockIdx.x, blockIdx.y));
+
+    if (threadIdx.x == 0) initialize_barrier(bar, 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        set_barrier_transaction_bytes(bar, tx_bytes);
+        auto per = tma.get_slice(0);
+        copy(tma.with(bar), per.partition_S(gt), per.partition_D(sT));
+    }
+    __syncthreads();
+    wait_barrier(bar, 0);
+
+    const int row0 = blockIdx.x * CM, col0 = blockIdx.y * CN;
+    for (int i = threadIdx.x; i < CM * CN; i += blockDim.x) {
+        int r = i / CN, c = i % CN;
+        b[(col0 + r) * M + (row0 + c)] = sT(c, r);
+    }
+}
+
+static Result run_t4() {
+    print_separator("t4  TMA load + SW128 smem");
+
+    Buffers buf;
+    auto swz = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, make_shape(Int<CM>{}, Int<CN>{}));
+    auto mA = make_tensor(make_gmem_ptr(buf.d_a),
+                          make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
+    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mA, swz);
+
+    int conflict = worst_col_conflict(swz);
+    transpose_t4_kernel<<<grid(), NTHR, cosize_v<decltype(swz)> * sizeof(float)>>>(
+        tma, swz, buf.d_b);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    bool ok = buf.check();
+    printf("  %-34s 列读 %2d-way   %s\n", "t4  TMA load + SW128 smem", conflict, ok ? "正确" : "错误");
+    return {"t4  TMA load + SW128 smem", conflict, ok};
+}
+
+// ===========================================================================
+// Example t5 —— TMA load + TMA store (本章终点, §3.2 的完整版)
+//
+// 两端都是硬件。转置怎么做? 这里有两个选择, 本章用**手写转置 + TMA store**:
 //
 //   方案 A (本章): plain smem -> 全 CTA 手写转置 -> TMA store
 //                 转置是"读写 smem"这个小循环, 其余都是硬件搬运
@@ -175,9 +325,9 @@ __global__ static void transpose_tma_kernel(__grid_constant__ const TmaLoad tma,
 // 就是"读 A 的一列写 B 的一行"这个逻辑操作, 不是搬运。
 // ===========================================================================
 template <class SLay, class TmaLoad, class TmaStore>
-__global__ static void transpose_both_kernel(__grid_constant__ const TmaLoad tma_load,
-                                             __grid_constant__ const TmaStore tma_store,
-                                             SLay slay) {
+__global__ static void transpose_t5_kernel(__grid_constant__ const TmaLoad tma_load,
+                                           __grid_constant__ const TmaStore tma_store,
+                                           SLay slay) {
     constexpr int tx_bytes = CM * CN * sizeof(float);
     extern __shared__ __align__(128) char raw[];
     __shared__ uint64_t bar;
@@ -227,84 +377,40 @@ __global__ static void transpose_both_kernel(__grid_constant__ const TmaLoad tma
     tma_store_wait<0>();
 }
 
-// ===========================================================================
-// host 侧: 六个版本, 每版一个 host 函数
-// ===========================================================================
-template <class SLay>
-static void run_hand(const char* tag, SLay slay, Buffers& buf) {
-    CUDA_CHECK(cudaMemset(buf.d_b, 0, Buffers::bytes));
-    transpose_hand_kernel<<<grid(), NTHR, cosize_v<SLay> * sizeof(float)>>>(buf.d_a, buf.d_b, slay);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    printf("  %-34s 列读 %2d-way   %s\n", tag, worst_col_conflict(slay),
-           buf.check() ? "正确" : "错误");
-}
+static Result run_t5() {
+    print_separator("t5  TMA load + TMA store");
 
-template <class SLay>
-static void run_tma(const char* tag, SLay slay, Buffers& buf) {
-    auto mA = make_tensor(make_gmem_ptr(buf.d_a),
-                          make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
-    auto tma = make_tma_copy(SM90_TMA_LOAD{}, mA, slay);
-    CUDA_CHECK(cudaMemset(buf.d_b, 0, Buffers::bytes));
-    transpose_tma_kernel<<<grid(), NTHR, cosize_v<SLay> * sizeof(float)>>>(tma, slay, buf.d_b);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    printf("  %-34s 列读 %2d-way   %s\n", tag, worst_col_conflict(slay),
-           buf.check() ? "正确" : "错误");
-}
-
-static void run_both(const char* tag, Buffers& buf) {
+    Buffers buf;
     auto mA = make_tensor(make_gmem_ptr(buf.d_a),
                           make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}));
     auto mB = make_tensor(make_gmem_ptr(buf.d_b),
                           make_layout(make_shape(Int<N>{}, Int<M>{}), LayoutRight{}));
-    auto slay = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{},
-                              make_shape(Int<CM>{}, Int<CN>{}));
-    auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, mA, slay);
-    auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mB, slay);
-    CUDA_CHECK(cudaMemset(buf.d_b, 0, Buffers::bytes));
-    transpose_both_kernel<<<grid(), NTHR, cosize_v<decltype(slay)> * sizeof(float)>>>(
-        tma_load, tma_store, slay);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    printf("  %-34s 列读 %2d-way   %s\n", tag, worst_col_conflict(slay),
-           buf.check() ? "正确" : "错误");
-}
-
-static void section6_rounds() {
-    print_separator("§6  capstone: 转置六版");
-
-    Buffers buf;
-    auto plain = make_layout(make_shape(Int<CM>{}, Int<CN>{}), LayoutRight{});
     auto swz = tile_to_shape(GMMA::Layout_K_SW128_Atom<float>{}, make_shape(Int<CM>{}, Int<CN>{}));
+    auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, mA, swz);
+    auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mB, swz);
 
-    printf("  A: %dx%d float, row-major;  B = A^T (B[n,m] = A[m,n])\n", M, N);
-    printf("  tile %dx%d, grid (%d,%d), 每 CTA %d 线程\n\n", CM, CN, grid().x, grid().y, NTHR);
-    printf("  每一版只换一件事:\n\n");
+    int conflict = worst_col_conflict(swz);
+    transpose_t5_kernel<<<grid(), NTHR, cosize_v<decltype(swz)> * sizeof(float)>>>(
+        tma_load, tma_store, swz);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    run_hand("t1  手写 + plain smem", plain, buf);
-    run_hand("t2  手写 + SW128 smem", swz, buf);
-    run_tma("t3  TMA load + plain smem", plain, buf);
-    run_tma("t4  TMA load + SW128 smem", swz, buf);
-    run_both("t5  TMA load + TMA store", buf);
-
-    printf("\n  怎么读这张表:\n");
-    printf("    t1 -> t2   手写搬运也吃 swizzle 的红利: 列读 32-way -> 16-way\n");
-    printf("    t1 -> t3   TMA 替换手写 load, 结果一样 —— 搬运换硬件, 转置逻辑不动\n");
-    printf("    t2 -> t4   TMA + swizzle 是本章主线: 搬运换硬件, 摆法由 descriptor 管\n");
-    printf("    t4 -> t5   两端都交给硬件: 两条搬运指令, 其余线程只做转置本身\n");
-
-    printf("\n  注意这里 swizzle 只把列读从 32-way 降到 16-way:\n");
-    printf("  因为 tile 是 32x32, SW128 原子的 8 行模式 (32x32 的 4x4 分块) 只\n");
-    printf("  用了一半。tile 更大时 (比如 128x128, 见 cute_05 之后) 会降到 8-way。\n");
-    printf("  这不妨碍结论: plain 的 32-way 是实打实的最坏情况。\n");
+    bool ok = buf.check();
+    printf("  %-34s 列读 %2d-way   %s\n", "t5  TMA load + TMA store", conflict, ok ? "正确" : "错误");
+    return {"t5  TMA load + TMA store", conflict, ok};
 }
 
 // ===========================================================================
-// §6.2  越界版: 不整除的矩阵
+// Example t6 —— 越界版: 不整除的矩阵 (§3.3 的边界能力实战)
+//
+// 1000 % 32 = 8, 640 % 32 = 0 -> 最右一列 CTA 的 tile 一半在界外。
+// 界外部分由 TMA load 自动填 0, 转置后由 TMA store 自动跳过不写。
+// **全程零 predicate**, 代码和整除版一模一样 —— 硬件自己兜边界。
 // ===========================================================================
-constexpr int OM = 1000, ON = 640;  // 1000 % 32 = 8, 640 % 32 = 0 -> 一半 tile 越界
+constexpr int OM = 1000, ON = 640;
 
 template <class TmaLoad, class TmaStore>
-__global__ static void transpose_oob_kernel(__grid_constant__ const TmaLoad tma_load,
-                                            __grid_constant__ const TmaStore tma_store) {
+__global__ static void transpose_t6_kernel(__grid_constant__ const TmaLoad tma_load,
+                                           __grid_constant__ const TmaStore tma_store) {
     constexpr int tx_bytes = CM * CN * sizeof(float);
     __shared__ __align__(128) float smem[CM * CN];
     __shared__ uint64_t bar;
@@ -349,8 +455,8 @@ __global__ static void transpose_oob_kernel(__grid_constant__ const TmaLoad tma_
     tma_store_wait<0>();
 }
 
-static void section6_oob() {
-    print_separator("§6.2  越界版: 不整除的矩阵");
+static Result run_t6() {
+    print_separator("t6  越界版: 不整除的矩阵");
 
     const int gM = (OM + CM - 1) / CM, gN = (ON + CN - 1) / CN;  // (32, 20)
     float *da, *db;
@@ -371,7 +477,7 @@ static void section6_oob() {
     auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, mA, slay);
     auto tma_store = make_tma_copy(SM90_TMA_STORE{}, mB, slay);
 
-    transpose_oob_kernel<<<dim3(gM, gN), NTHR>>>(tma_load, tma_store);
+    transpose_t6_kernel<<<dim3(gM, gN), NTHR>>>(tma_load, tma_store);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaMemcpy(hb, db, sizeof(float) * ON * OM, cudaMemcpyDeviceToHost));
@@ -388,20 +494,43 @@ static void section6_oob() {
     CUDA_CHECK(cudaFree(db));
     delete[] ha;
     delete[] hb;
+    return {"t6  越界 1000x640", 0, ok};
 }
 
+// ===========================================================================
+// main —— 按顺序跑六版, 每版自己打印, 这里只做小结
+// ===========================================================================
 int main() {
     printf("cute_04 capstone —— 矩阵转置: 本章所有工具的合练\n");
     printf("对应 README §6    需要 -arch=sm_90a\n");
 
-    section6_rounds();
-    section6_oob();
+    printf("  A: %dx%d float, row-major;  B = A^T (B[n,m] = A[m,n])\n", M, N);
+    printf("  tile %dx%d, grid (%d,%d), 每 CTA %d 线程\n\n", CM, CN, grid().x, grid().y, NTHR);
+    printf("  每一版只换一件事:\n\n");
+
+    Result results[] = {run_t1(), run_t2(), run_t3(), run_t4(), run_t5(), run_t6()};
+
+    printf("\n  怎么读这张表:\n");
+    printf("    t1 -> t2   手写搬运也吃 swizzle 的红利: 列读 32-way -> 16-way\n");
+    printf("    t1 -> t3   TMA 替换手写 load, 结果一样 —— 搬运换硬件, 转置逻辑不动\n");
+    printf("    t2 -> t4   TMA + swizzle 是本章主线: 搬运换硬件, 摆法由 descriptor 管\n");
+    printf("    t4 -> t5   两端都交给硬件: 两条搬运指令, 其余线程只做转置本身\n");
+
+    printf("\n  注意这里 swizzle 只把列读从 32-way 降到 16-way:\n");
+    printf("  因为 tile 是 32x32, SW128 原子的 8 行模式 (32x32 的 4x4 分块) 只\n");
+    printf("  用了一半。tile 更大时 (比如 128x128, 见 cute_05 之后) 会降到 8-way。\n");
+    printf("  这不妨碍结论: plain 的 32-way 是实打实的最坏情况。\n");
 
     print_separator("小结");
-    printf("  t1/t2   手写搬运: swizzle 是逻辑层重排, 只影响读 smem 的冲突\n");
-    printf("  t3/t4   TMA load: 搬运换硬件, swizzle 由 descriptor 在物理层做\n");
-    printf("  t5      两端 TMA: 两条搬运指令, 其余线程只做转置\n");
-    printf("  t6      不整除: 硬件自动兜边界, 零 predicate\n");
+    printf("%-36s %9s %7s\n", "version", "列读", "ok");
+    for (auto& r : results) {
+        char cbuf[16];
+        if (r.conflict > 0)
+            snprintf(cbuf, sizeof(cbuf), "%d-way", r.conflict);
+        else
+            snprintf(cbuf, sizeof(cbuf), "%s", "—");  // t6: 读 smem 由 TMA 硬件做
+        printf("%-36s %9s %7s\n", r.name, cbuf, r.ok ? "yes" : "NO");
+    }
 
     printf("\n这一章到此为止:\n");
     printf("  v0  手写搬运的基准\n");
