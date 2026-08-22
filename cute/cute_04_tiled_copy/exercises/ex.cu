@@ -88,7 +88,7 @@ static void ex1() {
     printf("练习 1 — 数 bank:\n");
     auto plain = make_layout(make_shape(Int<32>{}, Int<32>{}), LayoutRight{});
     // TODO: 一个 warp 读第 5 列, 最热的 bank 被请求几次?
-    constexpr int EX1_CONFLICT = 0;  // <-- 改成你的答案
+    constexpr int EX1_CONFLICT = 32;  // <-- 改成你的答案
     int w = max_bank_requests(32, [&](int l) { return int(plain(l, 5)) * 4; });
     expect("第 5 列 = 32-way conflict", w == EX1_CONFLICT && EX1_CONFLICT == 32);
     printf("\n");
@@ -101,7 +101,7 @@ static void ex2() {
     printf("练习 2 — 手算 swizzle 映射:\n");
     // TODO: Swizzle<5,0,5> 作用在 (32,32):(32,1) 上, 手算 swz_off(6, 3)。
     // 按 §4.3 四步: off = 6*32+3 = 195; 高 5 位 = 6; c XOR r = 3 XOR 6 = 5
-    constexpr int EX2_SWZ_OFF = 0;  // <-- 改成你的答案
+    constexpr int EX2_SWZ_OFF = 197;  // <-- 改成你的答案
     auto swz = composition(Swizzle<5, 0, 5>{}, plain());
     expect("swz(6,3) 正确", int(swz(6, 3)) == EX2_SWZ_OFF && EX2_SWZ_OFF == 197);
     printf("\n");
@@ -123,7 +123,7 @@ static void ex3() {
     printf("    Sw<3,2,3>: 列读 %2d-way, 行内连续 %2d\n", worst_col_all(s323), min_run(s323));
     // TODO: 哪个能用? (写名字, 检查用下面的断言)
     constexpr bool EX3_505_OK = false;
-    constexpr bool EX3_323_OK = false;
+    constexpr bool EX3_323_OK = true;
     expect("Sw<5,0,5> 不能用 (连续 1)", EX3_505_OK == false);
     expect("Sw<3,2,3> 能用 (连续 4)", EX3_323_OK == true);
     printf("\n");
@@ -137,16 +137,16 @@ static void ex4() {
     // CN=32 的 float tile (一行 128 字节)。
     // TODO: 四个模式哪些可用? (内层长度能否整除 CN)
     // SW128 内层 32 / SW64 内层 16 / SW32 内层 8 / INTER 内层 4
-    constexpr bool EX4_SW128_OK = false;
-    constexpr bool EX4_SW64_OK = false;
-    constexpr bool EX4_SW32_OK = false;
+    constexpr bool EX4_SW128_OK = true;
+    constexpr bool EX4_SW64_OK = true;
+    constexpr bool EX4_SW32_OK = true;
     constexpr bool EX4_INTER_OK = false;
     expect("SW128 可用 (32%32==0)", EX4_SW128_OK == true);
     expect("SW64 可用 (32%16==0)", EX4_SW64_OK == true);
     expect("SW32 可用 (32%8==0)", EX4_SW32_OK == true);
     expect("INTER 可用 (32%4==0)", EX4_INTER_OK == true);
     // TODO: 实用规则选哪个? (最大的)
-    constexpr bool EX4_PICK_SW128 = false;
+    constexpr bool EX4_PICK_SW128 = true;
     expect("选一行字节数最大的 SW128", EX4_PICK_SW128 == true);
     printf("\n");
 }
@@ -158,9 +158,9 @@ static void ex5() {
     printf("练习 5 — TMA 语义:\n");
     // TODO: 判断对错
     // (a) 手写 swizzle 改的是逻辑坐标的偏移; TMA 的 swizzle 改的是物理字节序。
-    constexpr bool EX5_A = false;   // 对 -> true
+    constexpr bool EX5_A = true;   // 对 -> true
     // (b) plain smem layout 交给 TMA 会搬错。
-    constexpr bool EX5_B = true;    // 错 -> false
+    constexpr bool EX5_B = false;    // 错 -> false
     expect("(a) 逻辑层 vs 物理层", EX5_A == true);
     expect("(b) plain 也能搬对", EX5_B == false);
     printf("\n");
